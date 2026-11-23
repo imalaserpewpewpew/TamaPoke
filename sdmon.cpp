@@ -7,7 +7,10 @@ static fs::FS &SpriteFS = LittleFS;
 #elif HAS_SD && SD_SPI
 #include <SPI.h>
 #include <SD.h>
-static SPIClass sdSpi(FSPI);
+#ifndef SD_SPI_HOST
+#define SD_SPI_HOST FSPI  // Guition; the 1.43 uses HSPI because its QSPI display holds SPI2/FSPI
+#endif
+static SPIClass sdSpi(SD_SPI_HOST);
 static fs::FS &SpriteFS = SD;
 #else
 #include <SD_MMC.h>
@@ -171,8 +174,12 @@ bool sdBegin() {
   // Debe correr despues de gfx->begin(): SCK/MOSI son los del bus 3-wire de la
   // pantalla, que solo se usa dentro de begin(). El ST7701S se deja deseleccionado
   // (CS alto) o tomaria el trafico del SD como comandos.
+#if defined(BOARD_GUITION_4848S040)
+  // (Only the Guition shares these pins. On the 1.43 the display CS belongs to
+  // the QSPI peripheral, and pinMode() here would unhook it from the panel.)
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
+#endif
   sdSpi.begin(SD_SPI_SCK, SD_SPI_MISO, SD_SPI_MOSI, -1);
   // nunca formatea (format_if_empty=false): la tarjeta debe venir en FAT32
   sdReady = SD.begin(SD_SPI_CS, sdSpi, SD_SPI_HZ, "/sdcard", 5, false);

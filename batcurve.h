@@ -86,3 +86,35 @@ struct BatMonitor {
     return now >= BAT_BOOT_GRACE_MS && lowReads >= BAT_CUTOFF_READS && now - lowSince >= BAT_CUTOFF_MS;
   }
 };
+
+// Waveshare ESP32-S3-Touch-AMOLED-1.43: no PMU, the charger's STAT pin only lights an LED and
+// there is no VBUS sense, so "on charge" is inferred from the battery voltage. Plugging a
+// charger in lifts a LiPo's terminal voltage by 100 mV or more within seconds; a lighter screen
+// load or light sleep gives back only a few tens of mV. Unplugging drops it again by a similar
+// amount. Pure logic, tests in test/test_batrise.cpp.
+#define BAT_RISE_MV 80               // rise above the recent minimum that counts as "on charge"
+#define BAT_FALL_MV 60               // drop below the peak since then that counts as "unplugged"
+#define BAT_RISE_WINDOW_MS 180000UL  // the minimum is tracked over about 3 minutes
+#define BAT_ABSENT_MV 2500           // below this the ADC sees no cell at all
+
+struct BatRiseDetector {
+  int smooth = 0, minMv = 0, peakMv = 0;
+  uint32_t minT = 0;
+  bool on = false;
+
+  void reset() { smooth = minMv = peakMv = 0; minT = 0; on = false; }
+  int smoothMv() const { return smooth; }
+  // one reading (mV); returns true while the cell looks like it is on charge
+  bool sample(int mv, uint32_t now) {
+    if (mv <= 0) return on;
+    smooth = smooth ? smooth + (mv - smooth) / 2 : mv;  // faster than BatMonitor: a plug-in is a step
+    if (!on) {
+      if (!minMv || smooth < minMv || now - minT > BAT_RISE_WINDOW_MS) { minMv = smooth; minT = now; }
+      if (smooth - minMv >= BAT_RISE_MV) { on = true; peakMv = smooth; }
+    } else {
+      if (smooth > peakMv) peakMv = smooth;
+      if (peakMv - smooth >= BAT_FALL_MV) { on = false; minMv = smooth; minT = now; }
+    }
+    return on;
+  }
+};

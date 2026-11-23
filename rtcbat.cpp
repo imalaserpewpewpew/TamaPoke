@@ -179,6 +179,81 @@ bool pwrShortPressed() {
   return hit;
 #endif
 }
+#elif defined(BOARD_AMOLED_143)
+// Waveshare 1.43: battery but no PMU. The voltage is read on GPIO4 through a
+// 1/3 divider (Waveshare's 01_ADC_Test multiplies by 3). Nothing tells the
+// firmware about USB or charging, so:
+//  - "USB present" means a USB host is talking to the board (HWCDC isPlugged()).
+//    A wall charger is not seen. That only means the board may deep-sleep while
+//    on a charger, which is fine: the ETA6098 charges in hardware either way.
+//  - "charging" is inferred from a clear voltage rise (BatRiseDetector,
+//    batcurve.h), or a connected host with the cell not full.
+//  - The board can't cut its own power: at the cutoff the sketch saves and goes
+//    into deep sleep instead (deepSleepNow() in TamaPoke.ino).
+static uint32_t pollMs = 2000, powerCacheT = 0;
+static int cachedPct = -1, cachedMv = 0;
+static bool cachedCharging = false, cachedUsb = false;
+static BatMonitor mon;
+static BatRiseDetector rise;
+static bool monDischarging = false;
+
+static bool hostConnected() {
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  return Serial.isPlugged();  // HWCDC: a host is sending USB frames
+#else
+  return false;
+#endif
+}
+
+static int readBatMv() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(BAT_ADC_PIN);  // calibrated mV at the pin
+  return (int)(sum / 8) * BAT_DIVIDER;
+}
+
+bool batBegin() {
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);  // 0-3.1 V at the pin: up to ~9 V at the cell
+  return true;
+}
+void pmuEnablePanel() {}  // panel power is LCD_EN (GPIO42), driven in setup()
+void batSetPollMs(uint32_t ms) { pollMs = ms; }
+
+static void refreshPower() {
+  uint32_t now = millis();
+  if (powerCacheT && now - powerCacheT < pollMs) return;
+  powerCacheT = now ? now : 1;
+  int mv = readBatMv();
+  cachedMv = mv;
+  cachedUsb = hostConnected();
+  if (mv < BAT_ABSENT_MV) {  // no cell: running from USB
+    cachedPct = -1;
+    cachedCharging = false;
+    mon.reset();
+    rise.reset();
+    monDischarging = false;
+    return;
+  }
+  bool rising = rise.sample(mv, now);
+  bool discharging = !cachedUsb && !rising;
+  if (discharging != monDischarging) {
+    mon.reset();
+    mon.seed(cachedPct);  // after unplugging the percentage doesn't jump up (voltage still inflated)
+    monDischarging = discharging;
+  }
+  if (discharging) cachedPct = mon.sample(mv, now);
+  else cachedPct = batPercentFromMv(rise.smoothMv());  // on charge the voltage reads high: an estimate
+  cachedCharging = (rising || cachedUsb) && cachedPct < 100;
+}
+
+int batPercent() { refreshPower(); return cachedPct; }
+bool batCharging() { refreshPower(); return cachedCharging; }
+int batMillivolts() { refreshPower(); return cachedMv; }
+bool batShouldShutdown() { refreshPower(); return monDischarging && mon.shutdownNeeded(millis()); }
+void batPowerOff() { mon.reset(); }  // the sketch deep-sleeps right after (no PMU to cut power)
+bool usbPresent() { refreshPower(); return cachedUsb; }
+bool usbPresentNow() { return hostConnected(); }
+void pwrSetup() {}
+bool pwrShortPressed() { return false; }
 #elif defined(BOARD_SPOTPEAR_BALL128)
 // SpotPear 1.28 AI Ball: battery but no PMU. Only the gauge is real: the
 // percentage comes from the raw ADC on GPIO1 (XiaoZhi's table, batcurve.h) and

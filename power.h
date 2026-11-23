@@ -117,6 +117,17 @@ inline bool lightSleepAllowed(const PowerCtx &c) {
 }
 #define POWER_SLEEP_MS 200  // duracion de cada sueno; el toque despierta antes
 
+// Deep sleep (boards with HAS_DEEP_SLEEP, the 1.43). After this long without a touch or a
+// visible pet event, on battery and outside a minigame, the sketch saves and deep-sleeps; a
+// shake wakes it (QMI8658 wake-on-motion). The RTC keeps time and the pet catches up on boot,
+// as after a power-off. 10 min = 5 min after the screen has gone nearly off (POWER_DIM2_MS).
+#ifndef POWER_DEEPSLEEP_MS
+#define POWER_DEEPSLEEP_MS 600000UL
+#endif
+inline bool deepSleepDue(const PowerCtx &c) {
+  return !c.usb && !c.gameOpen && c.idleMs > POWER_DEEPSLEEP_MS;
+}
+
 // cada cuanto se lee la bateria por I2C
 inline uint32_t powerCacheMs(const PowerCtx &c) {
   return (c.screenOff || dimStageFor(c.idleMs) == DIM_OFF) ? 10000 : 2000;

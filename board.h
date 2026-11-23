@@ -8,6 +8,7 @@
 //       partition table in boards/175c/partitions.csv (tools/build_175c.sh does both).
 //   (Guition 4848S040: ver mas abajo, se elige con -DBOARD_GUITION_4848S040)
 //   (SpotPear 1.28" AI Ball: ver mas abajo, se elige con -DBOARD_SPOTPEAR_BALL128)
+//   (Waveshare ESP32-S3-Touch-AMOLED-1.43: below, -DBOARD_AMOLED_143; see PORTING_143.md)
 //
 // The default build (CI, web installer, Arduino IDE without extra flags) is the
 // original 1.75 and is unchanged by the 1.75C code, which is all behind this flag.
@@ -178,6 +179,74 @@
 #define HAS_SD 1
 #define SD_SPI 0
 #define BOARD_NAME "SpotPear ESP32-S3 1.28 AI Ball"
+
+#elif defined(BOARD_AMOLED_143)
+// Waveshare ESP32-S3-Touch-AMOLED-1.43 (466x466 round AMOLED, no PMU, no audio).
+// Experimental. Pins from Waveshare's own examples
+// (github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.43: examples/arduino/examples/
+// 07_LVGL_Test/lcd_config.h, 04_SD_Card, 01_ADC_Test, factory/main) and the
+// board schematic (IMU_INT, RTC_INT, OLED_EN). Same 466 layout as the 1.75:
+// nothing is rescaled. See PORTING_143.md.
+
+// --- Display: SH8601 or CO5300 over QSPI (Waveshare ships either) ----------
+// The controller is read at boot (register 0xDA, as Waveshare's read_lcd_id_bsp.c
+// does): 0x86 = SH8601, anything else = CO5300 (needs a 6 px column offset).
+#define LCD_SDIO0 11
+#define LCD_SDIO1 12
+#define LCD_SDIO2 13
+#define LCD_SDIO3 14
+#define LCD_SCLK  10
+#define LCD_CS    9
+#define LCD_RESET 21
+#define LCD_EN    42   // OLED_EN: panel power, high = on (factory firmware)
+#define LCD_WIDTH  466
+#define LCD_HEIGHT 466
+#define LCD_ID_SH8601 0x86
+// QSPI clock per controller: the CO5300 runs at 80 MHz on the 1.75 boards; the
+// SH8601 starts at 40 MHz (Waveshare's own value for it). DISPLAY_BEGIN_HZ is only
+// the fallback; the sketch picks per controller.
+#define DISPLAY_BEGIN_HZ     80000000
+#define DISPLAY_HZ_CO5300    80000000
+#define DISPLAY_HZ_SH8601    40000000
+
+// --- I2C: touch FT3168 (0x38), RTC PCF85063 (0x51), IMU QMI8658 share one bus --
+#define IIC_SDA 47
+#define IIC_SCL 48
+#define TOUCH_ADDR 0x38
+#define TOUCH_POLLING 1   // FT3168 INT and RESET are not wired (-1 in Waveshare's touch_bsp.c)
+#define TOUCH_FT3168  1
+#define RTC_INT_PIN 15    // PCF85063 INT (unused)
+#define IMU_INT_PIN 8     // QMI8658 INT1 -> GPIO8 (RTC-capable: deep sleep wake source)
+
+// --- microSD over SPI on its own host (the display holds SPI2/FSPI) --------
+#define HAS_SD 1
+#define SD_SPI 1
+#define SD_SPI_HOST HSPI  // SPI3, as in Waveshare's sd_card_bsp.c
+#define SD_SPI_CS   38
+#define SD_SPI_MOSI 39
+#define SD_SPI_MISO 40
+#define SD_SPI_SCK  41
+#define SD_SPI_HZ   20000000
+
+// --- Battery and buttons ------------------------------------------------------
+// Battery voltage on GPIO4 (ADC1 ch3) through a 1/3 divider (01_ADC_Test: x3).
+// The ETA6098 charger's STAT pin only drives an LED and there is no VBUS sense:
+// rtcbat.cpp estimates charging from the voltage. BOOT (GPIO0) sits inside the
+// case on this build, so the firmware does not use it.
+#define BAT_ADC_PIN 4
+#define BAT_DIVIDER 3
+#define BOOT_BUTTON_PIN 0
+
+// --- Capabilities -----------------------------------------------------------
+#define HAS_PMU 0
+#define HAS_RTC 1         // PCF85063 at 0x51 on the shared bus
+#define HAS_AUDIO 0       // no codec, no speaker output
+#define HAS_DEEP_SLEEP 1  // idle deep sleep, shake to wake (board143.cpp)
+#define BOARD_NAME "ESP32-S3-Touch-AMOLED-1.43"
+#endif
+
+#ifndef HAS_DEEP_SLEEP
+#define HAS_DEEP_SLEEP 0
 #endif
 
 // panel redondo (AMOLED 466) o cuadrado; la placa puede redefinirlo

@@ -20,7 +20,9 @@
 #include <Wire.h>
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"  // pines + capacidades de placa (pin_config.h / board.h); antes que el driver de tactil
-#if TOUCH_POLLING
+#if defined(TOUCH_FT3168)
+#include "TouchFT3168.hpp"  // Waveshare 1.43: polled FT3168
+#elif TOUCH_POLLING
 #include "TouchDrvGT911.hpp"
 #else
 #include "TouchDrvCSTXXX.hpp"
@@ -49,6 +51,7 @@
 #include "bootbutton.h"
 #include "screenlock.h"
 #include "trainingcapture.h"
+#include "board143.h"
 #include <Preferences.h>
 
 // Version del firmware. Subir este numero en cada release (y manifest.json para
@@ -129,6 +132,22 @@ public:
   }
 };
 #define CANVAS_CLASS Arduino_Canvas_Half
+#elif defined(BOARD_AMOLED_143)
+// Waveshare 1.43: Waveshare ships this board with either an SH8601 or a CO5300
+// (both 466x466 over QSPI). Both drivers are built here (their constructors don't
+// touch the hardware); setup() reads the controller ID and uses the one fitted.
+// The CO5300 needs the same 6 px column offset as on the 1.75 (Waveshare's flush
+// adds 6 to x for it); the SH8601 needs none.
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(
+  LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
+Arduino_CO5300 *panelCo5300 = new Arduino_CO5300(
+  bus, LCD_RESET, 0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT, 6, 0, 0, 0);
+Arduino_SH8601 *panelSh8601 = new Arduino_SH8601(
+  bus, LCD_RESET, 0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT);
+Arduino_OLED *panel = panelCo5300;  // replaced in setup() once the ID is known
+int32_t panelHz = DISPLAY_HZ_CO5300;
+void displaySetBrightness(uint8_t v) { panel->setBrightness(v); }
+#define GFX_CREATED_IN_SETUP 1  // the canvas needs the panel picked at boot
 #else
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
@@ -140,9 +159,15 @@ void displaySetBrightness(uint8_t v) { panel->setBrightness(v); }
 #ifndef CANVAS_CLASS
 #define CANVAS_CLASS Arduino_Canvas
 #endif
+#if GFX_CREATED_IN_SETUP
+Arduino_Canvas *gfx = nullptr;  // created in setup() (see BOARD_AMOLED_143 above)
+#else
 Arduino_Canvas *gfx = new CANVAS_CLASS(LCD_WIDTH, LCD_HEIGHT, panel);
+#endif
 
-#if TOUCH_POLLING
+#if defined(TOUCH_FT3168)
+TouchFT3168 touch;
+#elif TOUCH_POLLING
 TouchDrvGT911 touch;
 #elif defined(BOARD_SPOTPEAR_BALL128)
 TouchDrvCST816 touch;
@@ -449,6 +474,10 @@ void updateScreenLock(uint32_t now) {
 }
 
 void setup() {
+#if defined(BOARD_AMOLED_143)
+  // panel power on (and released from the deep-sleep hold) before anything else
+  bool wokeFromSleep = board143Boot();
+#endif
 #if defined(BOARD_SPOTPEAR_BALL128)
   // Hold the power latch first: on battery the board switches off without it.
   pinMode(POWER_LATCH_PIN, OUTPUT);
@@ -485,10 +514,23 @@ void setup() {
   pmuEnablePanel();
 #endif
 
+#if defined(BOARD_AMOLED_143)
+  if (wokeFromSleep) Serial.println("Woke from deep sleep (shake)");
+  {
+    uint8_t id = board143ReadPanelId();  // before gfx->begin(): bit-bangs the QSPI pins
+    bool sh = (id == LCD_ID_SH8601);
+    panel = sh ? (Arduino_OLED *)panelSh8601 : (Arduino_OLED *)panelCo5300;
+    panelHz = sh ? DISPLAY_HZ_SH8601 : DISPLAY_HZ_CO5300;
+    Serial.printf("Panel ID 0x%02X: %s at %ld MHz\n", id, sh ? "SH8601" : "CO5300", (long)(panelHz / 1000000));
+  }
+  gfx = new CANVAS_CLASS(LCD_WIDTH, LCD_HEIGHT, panel);
+  if (!gfx->begin(panelHz)) Serial.println("gfx->begin() fallo");
+#else
   // QSPI a 80MHz en la Waveshare (por defecto 40): el flush del framebuffer es
   // el cuello de botella del fps (~56ms a 40MHz). El panel RGB usa el
   // prefer_speed del rgbpanel (RGB_PCLK_HZ). Si mostrara basura, bajarlo.
   if (!gfx->begin(DISPLAY_BEGIN_HZ)) Serial.println("gfx->begin() fallo");
+#endif
   {  // nivel de brillo guardado (ajustes)
     Preferences p;
     p.begin("tamapoke", true);
@@ -506,7 +548,13 @@ void setup() {
     touchOk = touch.begin(TOUCH_WIRE, TOUCH_ADDR, TP_SDA, TP_SCL);
     if (!touchOk) delay(150);
   }
+#if defined(TOUCH_FT3168)
+  // FT3168 reports panel pixels, upright with the panel at rotation 0 (Waveshare's
+  // LVGL demo maps them 1:1): no mirror or swap
+  if (!touchOk) Serial.println("FT3168 not found");
+#else
   if (!touchOk) Serial.println("GT911 no detectado");
+#endif
   touch.setMaxCoordinates(LCD_WIDTH, LCD_HEIGHT);
   // orientacion nativa del modulo; si el montaje gira el tactil, ajustar
   // (setMirrorXY / setSwapXY) tras probar en la placa
@@ -564,6 +612,9 @@ void setup() {
   pet.syncClock(e);
 
   audioBegin();  // ES8311 + I2S + amplificador (suena un jingle de arranque)
+#if defined(BOARD_AMOLED_143)
+  board143ImuBegin();  // QMI8658: shake-to-wake for deep sleep
+#endif
 
 #if BOARD_AMOLED_175C
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
@@ -596,6 +647,28 @@ void ensureMon() {
     if (!pmd.loaded) mon.load(pet.speciesId, pet.shiny);  // respaldo: B/N
   }
 }
+
+#if HAS_DEEP_SLEEP
+// Saves, turns the panel off and deep-sleeps (board143.cpp). A shake wakes the
+// board, which boots normally; the RTC kept the time, so the pet catches up the
+// same way it does after a power-off. Only returns if the IMU could not be armed.
+void deepSleepNow(const char *why) {
+  if (!board143CanDeepSleep()) return;  // no IMU: nothing could wake it again
+  static uint32_t lastTry = 0;           // if arming failed, retry once a minute, not every pass
+  if (lastTry && millis() - lastTry < 60000) return;
+  lastTry = millis() ? millis() : 1;
+  Serial.printf("Going to deep sleep (%s)\n", why);
+  pet.flushSave();
+  // let the previous frame's QSPI DMA finish before sending panel commands
+  uint32_t since = millis() - lastRender;
+  if (since < 100) delay(100 - since);
+  displaySetBrightness(0);
+  panel->displayOff();
+  board143DeepSleep();  // does not return when it works
+  panel->displayOn();   // arming failed: stay up; updateBrightness() restores the level
+  panelBrightness = 0;
+}
+#endif
 
 void loop() {
   uint32_t now = millis();
@@ -641,6 +714,9 @@ void loop() {
   if (batShouldShutdown() && !usbPresent()) {
     pet.flushSave();
     displaySetBrightness(0);
+#if HAS_DEEP_SLEEP
+    deepSleepNow("battery low");  // no PMU to cut power: deep sleep instead (a shake wakes it)
+#endif
     batPowerOff();
   }
 
@@ -691,6 +767,9 @@ void loop() {
   // entera, asi que no queda nada a medias; y al quedarse lastRender congelado, el primer
   // frame tras despertar sale en el acto.
   PowerCtx pc = powerCtx(millis());
+#if HAS_DEEP_SLEEP
+  if (deepSleepDue(pc)) deepSleepNow("idle");  // power.h: 10 min untouched, on battery
+#endif
   audioSetIdle(!amplifierWanted(pc));  // el amplificador consume en reposo
   batSetPollMs(powerCacheMs(pc));
   uint32_t interval = frameIntervalMs(pc);
@@ -807,6 +886,26 @@ void idleWait(PowerCtx c) {
     return;
   }
 #endif
+#if defined(BOARD_AMOLED_143)
+  // No touch INT on this board, so light sleep is timer-only and the touch is
+  // polled after each wake. Capped at 100 ms so a quick tap (~100-150 ms) on the
+  // nearly-off screen isn't missed between two polls. Same conditions as the
+  // other boards: screen nearly off and no USB host (keeps the serial port).
+  if (lightSleepAllowed(c) && millis() - lastRender >= 100) {
+    c.usb = usbPresentNow();
+    if (lightSleepAllowed(c)) {
+      uint32_t ms = 100;
+      uint32_t iv = frameIntervalMs(c);
+      if (iv) {
+        uint32_t due = lastRender + iv - millis();
+        if ((int32_t)due < (int32_t)ms) ms = (int32_t)due > 1 ? due : 1;
+      }
+      esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000);
+      esp_light_sleep_start();
+      return;
+    }
+  }
+#endif
   delay(idleDelayMs(c));
 }
 
@@ -822,6 +921,18 @@ void handleSerial() {
     Serial.printf("LOCK locked=%d panel_sleep=%d pwr=%d\n", screenLock.locked() ? 1 : 0,
                   panelSleeping ? 1 : 0,
                   digitalRead(PWR_SENSE_PIN) == PWR_SENSE_PRESSED ? 1 : 0);
+    return;
+  }
+#endif
+#if defined(BOARD_AMOLED_143)
+  if (line == "BAT?") {  // battery estimate (no PMU on this board; see rtcbat.cpp)
+    Serial.printf("BAT mv=%d pct=%d chg=%d usb=%d imu=%d\n", batMillivolts(), batPercent(),
+                  batCharging() ? 1 : 0, usbPresent() ? 1 : 0, board143CanDeepSleep() ? 1 : 0);
+    return;
+  }
+  if (line == "SLEEPNOW") {  // test deep sleep right away (even with USB); shake to wake
+    Serial.println("DONE");
+    deepSleepNow("serial");
     return;
   }
 #endif
