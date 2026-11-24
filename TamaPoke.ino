@@ -493,6 +493,11 @@ void setup() {
   // y nadie lo vacia) -> con timeout 0 los mensajes se descartan
   Serial.setTxTimeoutMs(0);
   Serial.printf("TamaPoke fw v%s (%s)\n", FW_VERSION, BOARD_NAME);
+#if defined(BOARD_AMOLED_143)
+  // 2 = woke from the IMU (ext0); 0 = normal power-on/reset
+  Serial.printf("Boot: wake cause=%d reset reason=%d\n", (int)esp_sleep_get_wakeup_cause(),
+                (int)esp_reset_reason());
+#endif
   loadLang();  // idioma guardado (ES por defecto)
   Wire.begin(IIC_SDA, IIC_SCL);
   // CST9217 (tactil), AXP2101 (PMU) y PCF85063 (RTC) comparten este bus I2C.
@@ -655,7 +660,8 @@ void ensureMon() {
 void deepSleepNow(const char *why) {
   if (!board143CanDeepSleep()) return;  // no IMU: nothing could wake it again
   static uint32_t lastTry = 0;           // if arming failed, retry once a minute, not every pass
-  if (lastTry && millis() - lastTry < 60000) return;
+  bool manual = strcmp(why, "serial") == 0;  // SLEEPNOW always tries
+  if (!manual && lastTry && millis() - lastTry < 60000) return;
   lastTry = millis() ? millis() : 1;
   Serial.printf("Going to deep sleep (%s)\n", why);
   pet.flushSave();

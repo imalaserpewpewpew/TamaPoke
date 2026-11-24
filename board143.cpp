@@ -6,7 +6,11 @@
 #include <driver/gpio.h>
 #include <driver/rtc_io.h>
 #include <esp_rom_sys.h>
-#include <SensorQMI8658.hpp>
+// SensorLib 0.5.x ships two different classes both named SensorQMI8658: the
+// deprecated header-only one (<SensorQMI8658.hpp>) and the new driver whose
+// methods are compiled into the library. Including the old one links the two
+// together and crashes in begin(), so use the new driver header directly.
+#include <ImuDrv.hpp>  // pulls in sensor/imu/qmi8658/SensorQMI8658.hpp
 
 static SensorQMI8658 imu;
 static bool imuOk = false;
@@ -85,22 +89,41 @@ bool board143DeepSleep() {
   // WoM on INT1 (the only IMU pin wired, to GPIO8), initial level high: a motion
   // event toggles it low. 128 Hz low-power accelerometer, the gyro stays off.
   // Blanking: the first 32 samples (0.25 s) after arming are ignored.
-  if (!imu.configWakeOnMotion(SLEEP_WOM_MG, SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
-                              SensorQMI8658::INTERRUPT_PIN_1, 1, 0x20)) {
+  if (!imu.configWakeOnMotionAdvanced(SLEEP_WOM_MG, 128.0f, SensorQMI8658::IntPin::PIN1,
+                                      1, 0x20, AccelFullScaleRange::FS_8G)) {
     Serial.println("QMI8658 wake-on-motion not armed: staying awake");
     return false;
   }
-  delay(20);
-  int idle = digitalRead(IMU_INT_PIN);  // expected HIGH; wake on the opposite level
-  Serial.printf("Deep sleep: shake to wake (INT1 idle=%d)\n", idle);
+  // Let the blanking window pass, then clear any WoM event already latched
+  // (reading STATUS1 via update() clears it) and require INT1 to sit HIGH for
+  // 300 ms before sleeping. Never guess the polarity from one read: a level
+  // caught mid-event made the board wake again straight away.
+  pinMode(IMU_INT_PIN, INPUT_PULLUP);
+  delay(400);
+  bool quiet = false;
+  for (int attempt = 0; attempt < 5 && !quiet; attempt++) {
+    imu.update();
+    delay(20);
+    quiet = true;
+    for (int i = 0; i < 30; i++) {
+      if (digitalRead(IMU_INT_PIN) == LOW) { quiet = false; break; }
+      delay(10);
+    }
+    if (!quiet) Serial.printf("Deep sleep: INT1 low (motion?), retry %d\n", attempt + 1);
+  }
+  if (!quiet) {
+    Serial.println("Deep sleep: INT1 never settled HIGH: staying awake");
+    return false;
+  }
+  Serial.println("Deep sleep: shake to wake (INT1 idle=1, wake on LOW)");
   Serial.flush();
   // panel power off for the whole sleep (GPIO42 is not an RTC pin: digital hold)
   digitalWrite(LCD_EN, LOW);
   gpio_hold_en((gpio_num_t)LCD_EN);
   gpio_deep_sleep_hold_en();
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)IMU_INT_PIN, idle ? 0 : 1);
-  if (idle) { rtc_gpio_pullup_en((gpio_num_t)IMU_INT_PIN); rtc_gpio_pulldown_dis((gpio_num_t)IMU_INT_PIN); }
-  else { rtc_gpio_pulldown_en((gpio_num_t)IMU_INT_PIN); rtc_gpio_pullup_dis((gpio_num_t)IMU_INT_PIN); }
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)IMU_INT_PIN, 0);
+  rtc_gpio_pullup_en((gpio_num_t)IMU_INT_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)IMU_INT_PIN);
   esp_deep_sleep_start();
   return true;  // not reached
 }
