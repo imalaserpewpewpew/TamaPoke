@@ -1,5 +1,11 @@
 #pragma once
 
+// TamaDroid targets the Waveshare ESP32-S3-Touch-AMOLED-1.43 by default, so the
+// Arduino IDE builds it with no extra compiler flags (tools/build_143.sh still works).
+#if !defined(BOARD_AMOLED_143) && !defined(BOARD_GUITION_4848S040) && !defined(BOARD_SPOTPEAR_BALL128) && !(defined(BOARD_AMOLED_175C) && BOARD_AMOLED_175C)
+#define BOARD_AMOLED_143 1
+#endif
+
 // Target board for this firmware.
 //
 //   0 = Waveshare ESP32-S3-Touch-AMOLED-1.75  (original TamaPoke board, microSD) - default

@@ -41,6 +41,10 @@
 #include <driver/gpio.h>
 #include "species.h"
 #include "dex.h"
+#include "droid_ui.h"
+#if DROID_PREVIEW
+#include "game_sprites.h"
+#endif
 #include "pet.h"
 #include "sdmon.h"
 #include "rtcbat.h"
@@ -239,6 +243,38 @@ float sackShake = 0;
 uint8_t sackGain = 0;
 bool sackNewHi = false;
 
+#if DROID_PREVIEW
+// TamaDroid: game menu, blaster training (replaces the ball game) and circuit repair
+uint32_t gameMenuUntil = 0;
+float remoteX = 233;            // training remote position (it drifts along the top)
+bool boltLive = false, boltBack = false;
+uint32_t nextBoltAt = 0;
+uint32_t blShakeUntil = 0, blHurtUntil = 0, blFlashUntil = 0, blRemoteHitUntil = 0;
+uint8_t blCombo = 0;
+uint32_t cargoTapAt = 0;
+uint32_t circShortUntil = 0, circOkUntil = 0, circShakeUntil = 0;
+struct Spark { float x, y, vx, vy; uint32_t until; uint16_t col; };
+Spark blSparks[18];
+bool circOpen = false;
+uint8_t circSeq[40];
+uint8_t circLen = 0, circPos = 0, circPhase = 0;  // phase 0 watch, 1 repeat, 2 result
+uint32_t circT0 = 0, circOverUntil = 0, circFlashUntil = 0;
+int8_t circFlash = -1;
+bool circNewHi = false;
+void startCircuit();
+void circuitTap(int16_t x, int16_t y);
+void renderCircuit();
+bool misPickOpen = false;
+uint8_t misSel = 0;
+void renderMissionPick();
+void missionPickTap(int16_t x, int16_t y);
+void renderMissionReport();
+void drawAway();
+void drawCrate(uint8_t taps);
+static void drawIdx(const IdxSprite &sp, int x, int y, int s, bool dim);
+static void blPanel(int x, int y, int w, int h);
+#endif
+
 // las 9 especies con sprite propio en flash (respaldo sin SD): dex -> indice
 int flashIdxForDex(int16_t dex) {
   static const int8_t IDX[10] = { -1, 3, 4, 5, 0, 1, 2, 6, 7, 8 };
@@ -261,10 +297,17 @@ struct Btn {
   const char *const *icon;
 };
 Btn buttons[4] = {
+#if DROID_PREVIEW
+  { 140 + UI_DX, 390, SPR_ICON_CELL_Y },  // charge (comer)
+  { 202 + UI_DX, 404, SPR_ICON_REMOTE },  // training remote (jugar)
+  { 264 + UI_DX, 404, SPR_ICON_STANDBY }, // standby / power down (luz)
+  { 326 + UI_DX, 390, SPR_ICON_OIL },     // oil bath (bano)
+#else
   { 140 + UI_DX, 390, SPR_ICON_FOOD },   // comer
   { 202 + UI_DX, 404, SPR_ICON_PLAY },   // jugar
   { 264 + UI_DX, 404, SPR_ICON_LIGHT },  // luz
   { 326 + UI_DX, 390, SPR_ICON_CLEAN },  // bano
+#endif
 };
 #define BTN_HALF 26  // boton de 52x52
 #define BTN_HIT 36   // radio tactil (un poco mas generoso)
@@ -660,7 +703,7 @@ void ensureMon() {
 void deepSleepNow(const char *why) {
   if (!board143CanDeepSleep()) return;  // no IMU: nothing could wake it again
   static uint32_t lastTry = 0;           // if arming failed, retry once a minute, not every pass
-  bool manual = strcmp(why, "serial") == 0;  // SLEEPNOW always tries
+  bool manual = strcmp(why, "serial") == 0 || strcmp(why, "menu") == 0;  // asked for: always try
   if (!manual && lastTry && millis() - lastTry < 60000) return;
   lastTry = millis() ? millis() : 1;
   Serial.printf("Going to deep sleep (%s)\n", why);
@@ -802,7 +845,11 @@ PowerCtx powerCtx(uint32_t now) {
   c.screenOff = c.screenOff || screenLock.blank(now);
 #endif
   c.sleeping = pet.sleeping;
+#if DROID_PREVIEW
+  c.gameOpen = gameOpen || sackOpen || circOpen;
+#else
   c.gameOpen = gameOpen || sackOpen;
+#endif
   c.usb = usbPresent();
   c.charging = batCharging();
   c.batPct = batPercent();
@@ -1248,6 +1295,9 @@ void openClock();  // prototipo
 void onSwipeV(int dir) {
   if (pet.awaitingStarter()) return;  // bloqueado durante la eleccion de inicial
   if (gameOpen || galleryOpen || kbOpen || sackOpen || pet.ceremony) return;
+#if DROID_PREVIEW
+  if (circOpen || misPickOpen) return;
+#endif
   if (clockOpen) { clockOpen = false; return; }
   if (cardOpen) {
     if (dir < 0) cardOpen = false;  // arriba cierra la ficha
@@ -1265,6 +1315,9 @@ void onSwipeV(int dir) {
 void onSwipe(int dir) {
   if (pet.awaitingStarter()) return;  // bloqueado durante la eleccion de inicial
   if (gameOpen || kbOpen || clockOpen) return;
+#if DROID_PREVIEW
+  if (circOpen || misPickOpen) return;
+#endif
   if (cardOpen) {  // dentro de la ficha: cambiar entre las 4 paginas
     int p = (int)cardPage + (dir > 0 ? -1 : 1);  // izquierda avanza
     cardPage = p < 0 ? 0 : (p > 3 ? 3 : p);
@@ -1338,6 +1391,20 @@ void onTap(int16_t x, int16_t y) {
     gameTap(x, y);
     return;
   }
+#if DROID_PREVIEW
+  if (circOpen) {
+    circuitTap(x, y);
+    return;
+  }
+  if (misPickOpen) {
+    missionPickTap(x, y);
+    return;
+  }
+  if (pet.repUnseen && !pet.onMission()) {  // tap dismisses the mission report
+    pet.seenReport();
+    return;
+  }
+#endif
   if (choiceKind) {          // dialogo de decision: boton accion (arriba) / mantener (abajo)
     bool b1 = (x >= 93 + UI_DX && x <= 373 + UI_DX && y >= 206 && y <= 258);  // accion
     bool b2 = (x >= 93 + UI_DX && x <= 373 + UI_DX && y >= 268 && y <= 320);  // mantener / quedaros
@@ -1360,14 +1427,32 @@ void onTap(int16_t x, int16_t y) {
   }
   if (feedMenuUntil) {       // selector de comida
     if (timeLeft(feedMenuUntil) && y >= 288 && y <= 352 && x >= 101 + UI_DX && x < 365 + UI_DX) {
+#if DROID_PREVIEW
+      if (x < CX + UI_DX) pet.feedCell();  // left: power cell, right: premium oil
+      else pet.feedCandy();
+#else
       int item = (x - 101 - UI_DX) / 66;
       if (item == 3) pet.feedCandy();
       else pet.feedBerry(item);
+#endif
       sfxPlay(SFX_EAT);
     }
     feedMenuUntil = 0;
     return;
   }
+#if DROID_PREVIEW
+  if (gameMenuUntil) {       // game menu: blaster / cargo / circuit / canyon (soon)
+    if (timeLeft(gameMenuUntil) && y >= 288 && y <= 352 && x >= 101 + UI_DX && x < 365 + UI_DX) {
+      int item = (x - 101 - UI_DX) / 66;
+      if (item == 0) startGame();
+      else if (item == 1) startSack();
+      else if (item == 2) startCircuit();
+      else if (item == 3) { misPickOpen = true; misSel = pet.onMission() ? (uint8_t)pet.missionJob : 0; }
+    }
+    gameMenuUntil = 0;
+    return;
+  }
+#endif
   if (pet.isEgg()) {
     pet.eggTap();
     sfxPlay(SFX_TAP);
@@ -1393,7 +1478,11 @@ void onTap(int16_t x, int16_t y) {
       if (i == 0) {
         if (!pet.sleeping) feedMenuUntil = millis() + 6000;
       } else if (i == 1) {
+#if DROID_PREVIEW
+        if (!pet.sleeping) gameMenuUntil = millis() + 6000;  // pick a game
+#else
         startGame();
+#endif
       } else if (i == 2) {
         pet.toggleLight();
       } else {
@@ -1454,19 +1543,78 @@ void drawClouds(uint32_t now, uint16_t col) {
   }
 }
 
+#if DROID_PREVIEW
+// half-ellipse dome sitting on baseY, lit from the left
+static void tatooineDome(int cx, int baseY, int rx, int ry, uint16_t col, uint16_t shade) {
+  for (int dy = 0; dy <= ry; dy++) {
+    float f = 1.0f - (float)(dy * dy) / (float)(ry * ry);
+    int w = (int)(rx * sqrtf(f > 0 ? f : 0));
+    if (w <= 0) continue;
+    gfx->fillRect(cx - w, baseY - dy, 2 * w, 1, col);
+    int sw = w / 3;  // shaded right third
+    gfx->fillRect(cx + w - sw, baseY - dy, sw, 1, shade);
+  }
+}
+
+// moisture vaporator: tripod legs, a ringed column, cap and antenna. sizePct scales it.
+static void drawVaporator(int vx, int baseY, int sizePct, bool night) {
+  uint16_t body = C565(0x9c, 0x98, 0x92), hi = C565(0xd8, 0xd4, 0xcc), dark = C565(0x5e, 0x5a, 0x56);
+  if (night) {
+    uint16_t nt = C565(0x16, 0x1c, 0x30);
+    body = lerp565(body, nt, 9, 16); hi = lerp565(hi, nt, 9, 16); dark = lerp565(dark, nt, 9, 16);
+  }
+  auto S = [&](int v) { return v * sizePct / 100; };
+  // tripod legs
+  gfx->fillTriangle(vx - S(14), baseY, vx - S(9), baseY, vx - S(2), baseY - S(16), dark);
+  gfx->fillTriangle(vx + S(14), baseY, vx + S(9), baseY, vx + S(2), baseY - S(16), dark);
+  // column with a highlight down the left side
+  gfx->fillRect(vx - S(4), baseY - S(62), S(9) | 1, S(50), body);
+  gfx->fillRect(vx - S(3), baseY - S(60), S(2) > 0 ? S(2) : 1, S(44), hi);
+  // condenser rings
+  gfx->fillRect(vx - S(8), baseY - S(52), S(17), S(5) > 0 ? S(5) : 1, dark);
+  gfx->fillRect(vx - S(7), baseY - S(34), S(15), S(4) > 0 ? S(4) : 1, dark);
+  gfx->fillRect(vx - S(6), baseY - S(16), S(13), S(4) > 0 ? S(4) : 1, body);
+  // cap and antenna
+  gfx->fillRect(vx - S(6), baseY - S(66), S(13), S(4) > 0 ? S(4) : 1, dark);
+  gfx->fillRect(vx, baseY - S(78), 1, S(12), dark);
+  gfx->fillRect(vx - S(4), baseY - S(74), S(9), 2, dark);
+}
+#endif
+
 void drawScene(uint8_t biome, uint32_t now, bool night) {
   int h = sceneHour();
   uint16_t top, bot;
+#if DROID_PREVIEW
+  biome = DROID_BIOME_TATOOINE;  // TamaDroid: desert planet with twin suns
+  if (night)            { top = C565(0x10, 0x10, 0x2a); bot = C565(0x2c, 0x22, 0x40); }
+  else if (h < 8)       { top = C565(0xe0, 0x8a, 0x6a); bot = C565(0xf6, 0xc8, 0x8a); }
+  else if (h < 18)      { top = C565(0xa8, 0xc8, 0xd8); bot = C565(0xf2, 0xe0, 0xb8); }
+  else                  { top = C565(0xc8, 0x60, 0x40); bot = C565(0xf2, 0xa8, 0x58); }
+#else
   if (night)            { top = C565(0x0c, 0x12, 0x24); bot = C565(0x1e, 0x26, 0x46); }
   else if (h < 8)       { top = C565(0xd1, 0x6a, 0x86); bot = C565(0xf3, 0xb8, 0x7c); }  // amanecer
   else if (h < 18)      { top = C565(0x8f, 0xc8, 0xea); bot = C565(0xdc, 0xee, 0xe6); }  // dia
   else                  { top = C565(0xc7, 0x5a, 0x4a); bot = C565(0xf0, 0xae, 0x64); }  // atardecer
+#endif
 
   // cielo en bandas
   for (int y = 0; y < HORIZON; y += 8)
     gfx->fillRect(0, y, LCD_WIDTH, 8, lerp565(top, bot, y, HORIZON));
 
   // sol o luna
+#if DROID_PREVIEW
+  // TamaDroid: kept below the name/status lines (the 1.43 crops the top of the canvas)
+  if (night) {
+    gfx->fillCircle(352, 150, 16, C565(0xe8, 0xee, 0xf5));
+    gfx->fillCircle(359, 146, 14, lerp565(top, bot, 150, HORIZON));  // creciente
+    gfx->fillCircle(130, 160, 6, C565(0xd8, 0xcc, 0xc0));            // segunda luna
+    for (auto &st : STARS) if (st[1] > 110) gfx->fillRect(st[0], st[1], 4, 4, UI_WHITE);
+  } else {
+    // twin suns: a big pale one and a smaller orange one
+    gfx->fillCircle(330, 150, 18, C565(0xff, 0xf0, 0xc0));
+    gfx->fillCircle(372, 168, 11, C565(0xff, 0xb8, 0x60));
+  }
+#else
   if (night) {
     gfx->fillCircle(360, 78, 24, C565(0xe8, 0xee, 0xf5));
     gfx->fillCircle(370, 72, 22, lerp565(top, bot, 78, HORIZON));  // creciente
@@ -1477,9 +1625,13 @@ void drawScene(uint8_t biome, uint32_t now, bool night) {
   } else {
     gfx->fillCircle(CX, HORIZON - 6, 34, C565(0xff, 0xf1, 0xc8));  // sol poniente
   }
+#endif
 
   // mar de la playa: una franja de agua sobre la arena
   uint16_t soil = BIOME_SOIL[biome < 6 ? biome : 0];
+#if DROID_PREVIEW
+  if (biome == DROID_BIOME_TATOOINE) soil = C565(0xe2, 0xbc, 0x82);  // sand
+#endif
   if (night) soil = lerp565(soil, C565(0x16, 0x1c, 0x30), 9, 16);
   if (biome == 1) {
     uint16_t sea = night ? C565(0x1c, 0x34, 0x52) : C565(0x4f, 0x96, 0xc4);
@@ -1519,6 +1671,28 @@ void drawScene(uint8_t biome, uint32_t now, bool night) {
       int fy = (f * 90 + now / 18) % HORIZON;
       gfx->fillRect(fx, fy, 3, 3, UI_WHITE);
     }
+#if DROID_PREVIEW
+  } else if (biome == DROID_BIOME_TATOOINE) {  // dunes, a homestead and moisture vaporators
+    uint16_t dune = lerp565(soil, C565(0xff, 0xf4, 0xd8), night ? 2 : 6, 16);
+    gfx->fillEllipse(120, HORIZON + 26, 130, 16, dune);
+    gfx->fillEllipse(360, HORIZON + 40, 150, 18, dune);
+    uint16_t nightTint = C565(0x16, 0x1c, 0x30);
+    // homestead: a big adobe dome with a doorway and a small dome beside it
+    uint16_t adobe = C565(0xec, 0xd8, 0xb0), adobeSh = C565(0xc9, 0xab, 0x80), door = C565(0x5a, 0x40, 0x30);
+    if (night) { adobe = lerp565(adobe, nightTint, 9, 16); adobeSh = lerp565(adobeSh, nightTint, 9, 16); door = lerp565(door, nightTint, 8, 16); }
+    uint16_t edge = lerp565(adobeSh, C565(0x40, 0x30, 0x24), 7, 16);  // outline so the domes read against the sand
+    gfx->fillEllipse(382, HORIZON + 3, 52, 4, lerp565(soil, C565(0x40, 0x30, 0x24), 4, 16));  // ground shadow
+    tatooineDome(372, HORIZON + 2, 36, 26, edge, edge);
+    tatooineDome(372, HORIZON + 2, 34, 24, adobe, adobeSh);
+    tatooineDome(418, HORIZON + 2, 18, 14, edge, edge);
+    tatooineDome(418, HORIZON + 2, 16, 12, adobe, adobeSh);
+    gfx->fillRoundRect(364, HORIZON - 14, 16, 16, 7, door);   // arched doorway
+    gfx->fillRect(364, HORIZON - 6, 16, 8, door);
+    gfx->fillRect(338, HORIZON - 1, 70, 3, adobeSh);           // footing
+    // moisture vaporators: a big one and a smaller one further away
+    drawVaporator(62, HORIZON + 2, 100, night);
+    drawVaporator(126, HORIZON - 2, 65, night);
+#endif
   } else if (biome == 0) {  // pradera: matas de hierba
     for (int gx : { 80, 175, 300, 395 })
       for (int b = -1; b <= 1; b++)
@@ -1687,6 +1861,9 @@ void printT(const char *s) {
 static bool staticScreen() {
   if (pet.awaitingStarter()) return true;
   if (galleryOpen || gameOpen || sackOpen) return false;  // la galeria gestiona su propio repintado
+#if DROID_PREVIEW
+  if (circOpen || misPickOpen || pet.repUnseen) return false;
+#endif
   if (kbOpen || clockOpen) return true;
   return cardOpen && cardPage != 0;  // la pagina 0 tiene el retrato animado
 }
@@ -1753,6 +1930,20 @@ bool render() {
     renderSack();
     return true;
   }
+#if DROID_PREVIEW
+  if (circOpen) {
+    renderCircuit();
+    return true;
+  }
+  if (misPickOpen) {
+    renderMissionPick();
+    return true;
+  }
+  if (pet.repUnseen && !pet.onMission() && !pet.isEgg()) {
+    renderMissionReport();
+    return true;
+  }
+#endif
   if (kbOpen) {
     renderKeyboard();
     return true;
@@ -1784,12 +1975,16 @@ bool render() {
 
   if (pet.isEgg()) {
     drawHeader(T(S_EGG_HDR), inkColor(), eggMsg());
+#if DROID_PREVIEW
+    drawCrate(pet.eggCracks());
+#else
     int s = 5, x = CX - 16 * s, y = PET_CY - 16 * s;
     drawMap(SPR_EGG, SPRITE_H, x, y, s, false);
     if (pet.eggCracks() >= 1)
       for (auto &c : CRACK1) gfx->fillRect(x + c[0] * s, y + c[1] * s, s, s, INK_K);
     if (pet.eggCracks() >= 2)
       for (auto &c : CRACK2) gfx->fillRect(x + c[0] * s, y + c[1] * s, s, s, INK_K);
+#endif
     if (pet.eggRarity() >= R_RARO) {
       const char *rar = (pet.eggRarity() == R_LEGENDARIO) ? T(S_EGG_LEGEND) : T(S_EGG_RARE);
       gfx->setTextColor(pet.eggRarity() == R_LEGENDARIO ? UI_BAR_WARN : 0x4C98);
@@ -1811,9 +2006,15 @@ bool render() {
     snprintf(name, sizeof(name), T(S_NAME_FMT), pet.shiny ? "*" : "", base, pet.level());
     drawHeader(name, gNight ? UI_INK_NIGHT : d.accent, statusMsg());
     drawStreakBadge();
-    drawPet();
-    drawBath();
-    drawPoops();
+#if DROID_PREVIEW
+    if (pet.onMission()) drawAway();
+    else
+#endif
+    {
+      drawPet();
+      drawBath();
+      drawPoops();
+    }
     // panel inferior: base limpia para barras y botones sobre el paisaje
     gfx->fillRect(0, 312, LCD_WIDTH, LCD_HEIGHT - 312, gNight ? UI_BG_NIGHT : UI_BG_DAY);
     drawBars();
@@ -1826,9 +2027,13 @@ bool render() {
 
   if (pet.sleeping) {
     gfx->setTextColor(UI_INK_NIGHT);
+#if DROID_PREVIEW
+    drawMap(SPR_ICON_STANDBY, 16, 312 + UI_DX, 112, 3, false);  // standby, not snoring
+#else
     setSize(3);
     setCur(320 + UI_DX, 130);
     printT("Zz");
+#endif
   }
 
   // selector de comida
@@ -1838,12 +2043,34 @@ bool render() {
     } else {
       gfx->fillRoundRect(101 + UI_DX, 288, 264, 64, 14, UI_WHITE);
       gfx->drawRoundRect(101 + UI_DX, 288, 264, 64, 14, inkColor());
+#if DROID_PREVIEW
+      drawMap(SPR_ICON_CELL_Y, 16, 143 + UI_DX, 296, 3, false);   // power cell
+      gfx->drawLine(CX + UI_DX, 298, CX + UI_DX, 342, UI_TRACK);   // divider
+      drawMap(SPR_ICON_OIL, 16, 275 + UI_DX, 296, 3, false);       // premium oil treat
+#else
       drawMap(SPR_ICON_FOOD, 16, 110 + UI_DX, 296, 3, false);
       drawMap(SPR_ICON_BERRY_B, 16, 176 + UI_DX, 296, 3, false);
       drawMap(SPR_ICON_BERRY_G, 16, 242 + UI_DX, 296, 3, false);
       drawMap(SPR_ICON_CANDY, 16, 308 + UI_DX, 296, 3, false);
+#endif
     }
   }
+
+#if DROID_PREVIEW
+  // game menu (same panel as the food menu)
+  if (gameMenuUntil) {
+    if (!timeLeft(gameMenuUntil)) {
+      gameMenuUntil = 0;
+    } else {
+      gfx->fillRoundRect(101 + UI_DX, 288, 264, 64, 14, UI_WHITE);
+      gfx->drawRoundRect(101 + UI_DX, 288, 264, 64, 14, inkColor());
+      drawMap(SPR_ICON_REMOTE, 16, 110 + UI_DX, 296, 3, false);
+      drawMap(SPR_ICON_CRATE, 16, 176 + UI_DX, 296, 3, false);
+      drawMap(SPR_ICON_CHIP, 16, 242 + UI_DX, 296, 3, false);
+      drawIdx(GS_MISSION, 308 + UI_DX, 296, 3, false);  // missions
+    }
+  }
+#endif
 
   // dialogo "soltar?" (pulsacion larga sobre el bicho)
   if (confirmUntil) {
@@ -1886,6 +2113,9 @@ bool render() {
 
 void startGame() {
   if (pet.isEgg() || pet.sleeping || pet.ceremony) return;
+#if DROID_PREVIEW
+  if (pet.onMission()) return;
+#endif
   gameOpen = true;
   gameOverUntil = 0;
   gameScore = 0;
@@ -1894,9 +2124,259 @@ void startGame() {
   hitTime = 0;
   gamePetX = CX;
   lastGameStep = millis();
+#if DROID_PREVIEW
+  blCombo = 0;
+  blShakeUntil = blHurtUntil = blFlashUntil = blRemoteHitUntil = 0;
+  for (auto &s : blSparks) s.until = 0;
+#endif
   respawnBall();
 }
 
+#if DROID_PREVIEW
+// TamaDroid blaster training: the training remote hovers over the homestead and fires
+// bolts at the droid. Tap a bolt to send it back; it bursts on the remote. Three bolts
+// that get through end the round. Same scoring/record/reward as the original ball game.
+#define BL_GROUND 392     // droid's feet
+#define BL_HIT_Y 330      // a bolt reaching this height has hit the droid
+#define BL_REMOTE_Y 150
+
+static void blSpawnSparks(float x, float y, int n, uint16_t c1, uint16_t c2) {
+  uint32_t now = millis();
+  for (int i = 0, made = 0; i < 18 && made < n; i++) {
+    if ((int32_t)(blSparks[i].until - now) > 0) continue;
+    float ang = random(628) / 100.0f, sp = 2.0f + random(40) / 10.0f;
+    blSparks[i] = { x, y, cosf(ang) * sp, sinf(ang) * sp - 1.0f, (uint32_t)(now + 260 + random(200)), (made & 1) ? c1 : c2 };
+    made++;
+  }
+}
+
+void fireBolt() {
+  ballX = remoteX;
+  ballY = BL_REMOTE_Y + 22;
+  float tx = gamePetX + (float)(random(41) - 20), ty = BL_HIT_Y + 20;
+  float sp = 3.6f + gameScore * 0.12f;
+  if (sp > 8.5f) sp = 8.5f;
+  float dx = tx - ballX, dy = ty - ballY;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len < 1) len = 1;
+  ballVX = dx / len * sp;
+  ballVY = dy / len * sp;
+  boltLive = true;
+  boltBack = false;
+}
+
+void respawnBall() {  // schedules the next bolt
+  boltLive = false;
+  uint32_t wait = 800 - (gameScore * 15 > 450 ? 450 : gameScore * 15);
+  nextBoltAt = millis() + wait;
+}
+
+#define GAME_EXIT_Y 40  // franja de arriba que sale del minijuego
+
+void gameTap(int16_t x, int16_t y) {
+  if (gameOverUntil) return;
+  float dx = ballX - x, dy = ballY - y;
+  bool hit = boltLive && !boltBack && dx * dx + dy * dy < 66 * 66;
+  if (!hit && y < GAME_EXIT_Y) {
+    gameOpen = false;
+    return;
+  }
+  if (hit) {  // deflected: send it back at the remote
+    gameScore++;
+    if (blCombo < 99) blCombo++;
+    sfxPlay(SFX_PLAY);
+    boltBack = true;
+    float tx = remoteX - ballX, ty = BL_REMOTE_Y - ballY;
+    float len = sqrtf(tx * tx + ty * ty);
+    if (len < 1) len = 1;
+    float sp = 9.0f;
+    ballVX = tx / len * sp;
+    ballVY = ty / len * sp;
+    hitX = ballX;
+    hitY = ballY;
+    hitTime = millis();
+    blFlashUntil = millis() + 160;  // droid's dome light blinks
+    blSpawnSparks(ballX, ballY, 10, C565(0xff, 0xf0, 0xa0), C565(0x90, 0xd8, 0xff));
+  }
+}
+
+void stepGame() {
+  uint32_t now = millis();
+  float k = lastGameStep ? (now - lastGameStep) / 85.0f : 1.0f;
+  if (k > 3.0f) k = 3.0f;
+  lastGameStep = now;
+  remoteX = CX + 118.0f * sinf(now * 0.0011f + gameScore * 0.35f);
+  if (!boltLive) {
+    if ((int32_t)(now - nextBoltAt) >= 0) fireBolt();
+  } else {
+    ballX += ballVX * k;
+    ballY += ballVY * k;
+    if (boltBack) {
+      float dx = ballX - remoteX, dy = ballY - BL_REMOTE_Y;
+      if (dx * dx + dy * dy < 26 * 26 || ballY < 40) {  // bursts on the remote
+        blSpawnSparks(ballX, ballY, 12, C565(0xff, 0xd0, 0x60), C565(0xff, 0xff, 0xff));
+        blRemoteHitUntil = now + 220;
+        respawnBall();
+      }
+    } else if (ballY >= BL_HIT_Y) {  // hit the droid
+      blCombo = 0;
+      blShakeUntil = now + 260;
+      blHurtUntil = now + 450;
+      blSpawnSparks(ballX, ballY, 8, C565(0xff, 0x60, 0x40), C565(0xff, 0xc0, 0x40));
+      sfxPlay(SFX_TAP);
+      if (++gameMisses >= 3) {
+        boltLive = false;
+        gameNewHi = (gameScore > pet.gameHi);
+        pet.playResult(gameScore);
+        sfxPlay(gameNewHi && gameScore > 0 ? SFX_MEDAL : SFX_LEVEL);
+        gameOverUntil = millis() + 4000;
+      } else {
+        respawnBall();
+      }
+    }
+  }
+  for (auto &s : blSparks) {
+    if ((int32_t)(s.until - now) <= 0) continue;
+    s.x += s.vx * k; s.y += s.vy * k; s.vy += 0.35f * k;
+  }
+  // the droid shuffles along under the remote
+  float chase = (remoteX - gamePetX) * 0.05f;
+  if (chase > 4) chase = 4;
+  if (chase < -4) chase = -4;
+  gamePetX += chase * k;
+}
+
+// indexed sprite (game_sprites.h) at integer scale, run-length filled
+static void drawIdx(const IdxSprite &sp, int x, int y, int s, bool dim) {
+  for (int r = 0; r < sp.h; r++) {
+    const uint8_t *row = sp.idx + r * sp.w;
+    int c = 0;
+    while (c < sp.w) {
+      uint8_t k = row[c];
+      int c0 = c;
+      while (c < sp.w && row[c] == k) c++;
+      if (k == 0xFF) continue;
+      uint16_t col = dim ? UI_TRACK : sp.pal[k];
+      gfx->fillRect(x + c0 * s, y + r * s, (c - c0) * s, s, col);
+    }
+  }
+}
+
+static void blPanel(int x, int y, int w, int h) {
+  gfx->fillRoundRect(x, y, w, h, 12, C565(0x1e, 0x26, 0x46));
+  gfx->drawRoundRect(x, y, w, h, 12, UI_WHITE);
+  gfx->drawRoundRect(x + 2, y + 2, w - 4, h - 4, 10, C565(0x4a, 0x58, 0x80));
+}
+
+void drawScene(uint8_t biome, uint32_t now, bool night);  // defined above
+
+void renderBlaster() {
+  uint32_t now = millis();
+  bool night = sceneHour() < 6 || sceneHour() >= 20;
+  drawScene(0, now, night);  // Tatooine homestead backdrop
+
+  if (gameOverUntil) {
+    if (!timeLeft(gameOverUntil)) { gameOpen = false; return; }
+    blPanel(CX - 130, 128, 260, 176);
+    gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+    setSize(2);
+    setCur(centerX("BOLTS DEFLECTED", 2), 146);
+    printT("BOLTS DEFLECTED");
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u", gameScore);
+    gfx->setTextColor(UI_WHITE);
+    setSize(6);
+    setCur(centerX(buf, 6), 176);
+    printT(buf);
+    setSize(2);
+    if (gameNewHi && gameScore > 0) {
+      gfx->setTextColor(UI_BAR_WARN);
+      setCur(centerX(T(S_NEW_RECORD), 2), 238);
+      printT(T(S_NEW_RECORD));
+    } else {
+      char rec[20];
+      snprintf(rec, sizeof(rec), T(S_RECORD_FMT), pet.gameHi);
+      gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+      setCur(centerX(rec, 2), 238);
+      printT(rec);
+    }
+    const char *msg = gameScore >= 10 ? T(S_GREAT_JOY) : T(S_PLUS_JOY);
+    gfx->setTextColor(UI_BAR_OK);
+    setCur(centerX(msg, 2), 270);
+    printT(msg);
+    flushUI();
+    return;
+  }
+
+  stepGame();
+  int shx = 0, shy = 0;
+  if (timeLeft(blShakeUntil)) { shx = (int)random(9) - 4; shy = (int)random(5) - 2; }
+
+  // droid: hurt shake, otherwise shuffling under the remote
+  if (pmd.loaded) {
+    uint8_t act = PMD_IDLE;
+    if (timeLeft(blHurtUntil) && pmd.has(PMD_HURT)) act = PMD_HURT;
+    else if (remoteX > gamePetX + 6 && pmd.has(PMD_WALKR)) act = PMD_WALKR;
+    else if (remoteX < gamePetX - 6 && pmd.has(PMD_WALKL)) act = PMD_WALKL;
+    drawPmdAct(act, (int)gamePetX + shx, BL_GROUND + shy, now, true, false, 3);
+  }
+
+  // training remote: bobs, its firing port glows just before a shot, flashes when hit
+  int ry = BL_REMOTE_Y + (int)(4 * sinf(now * 0.006f));
+  bool charging = !boltLive && (int32_t)(nextBoltAt - now) < 300;
+  drawIdx(charging ? GS_REMOTE_CHARGE : GS_REMOTE, (int)remoteX - GS_REMOTE.w + shx, ry - GS_REMOTE.h + shy, 2, false);
+  if (timeLeft(blRemoteHitUntil))
+    gfx->drawCircle((int)remoteX + shx, ry + shy, 30 + (int)(220 - (blRemoteHitUntil - now)) / 20, C565(0xff, 0xe0, 0x80));
+
+  // bolt: dark glow, bright body, white core, drawn along its direction of travel
+  if (boltLive) {
+    float sp = sqrtf(ballVX * ballVX + ballVY * ballVY);
+    float ux = sp > 0 ? ballVX / sp : 0, uy = sp > 0 ? ballVY / sp : 1;
+    uint16_t outer = boltBack ? C565(0x20, 0x60, 0xa0) : C565(0x90, 0x10, 0x10);
+    uint16_t body = boltBack ? C565(0x70, 0xc8, 0xff) : C565(0xff, 0x40, 0x30);
+    uint16_t core = boltBack ? C565(0xe0, 0xf6, 0xff) : C565(0xff, 0xe0, 0xd8);
+    int bx = (int)ballX + shx, by = (int)ballY + shy;
+    for (int i = 0; i <= 6; i++) gfx->fillCircle(bx - (int)(ux * i * 4), by - (int)(uy * i * 4), 6, outer);
+    for (int i = 0; i <= 6; i++) gfx->fillCircle(bx - (int)(ux * i * 4), by - (int)(uy * i * 4), 4, body);
+    for (int i = 0; i <= 5; i++) gfx->fillCircle(bx - (int)(ux * i * 4), by - (int)(uy * i * 4), 2, core);
+  }
+
+  // impact ring where a bolt was deflected
+  uint32_t ht = now - hitTime;
+  if (hitTime && ht < 240) {
+    int rad = 14 + (int)(ht / 8);
+    gfx->drawCircle((int)hitX + shx, (int)hitY + shy, rad, C565(0xff, 0xf0, 0xb0));
+    gfx->drawCircle((int)hitX + shx, (int)hitY + shy, rad + 1, C565(0xff, 0xd0, 0x70));
+  }
+  for (auto &s : blSparks)
+    if ((int32_t)(s.until - now) > 0) gfx->fillRect((int)s.x + shx, (int)s.y + shy, 3, 3, s.col);
+
+  // red edge flash when the droid takes a hit
+  if (timeLeft(blHurtUntil) && (blHurtUntil - now) > 250)
+    for (int r = 0; r < 6; r++) gfx->drawCircle(CX, CY, 230 - r, C565(0xe0, 0x30, 0x30));
+
+  // HUD: framed score panel, droid-dome lives under it, combo badge
+  blPanel(CX - 62, 24, 124, 50);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%u", gameScore);
+  gfx->setTextColor(UI_WHITE);
+  setSize(4);
+  setCur(centerX(buf, 4), 33);
+  printT(buf);
+  for (int i = 0; i < 3; i++)
+    drawIdx(GS_LIFE, CX - 46 + i * 32, 80, 2, i >= 3 - gameMisses);
+  if (blCombo >= 3) {
+    char cb[8];
+    snprintf(cb, sizeof(cb), "x%u", blCombo);
+    gfx->setTextColor(UI_BAR_WARN);
+    setSize(2);
+    setCur(CX + 70, 42);
+    printT(cb);
+  }
+  flushUI();
+}
+
+#else
 void respawnBall() {
   ballX = 150 + UI_DX + random(166);
   ballY = 96;
@@ -1981,10 +2461,15 @@ void stepGame() {
   gamePetX += chase * k;
 }
 
+#endif
+
 // ---------- saco de entrenamiento (entrena la fuerza) ----------
 
 void startSack() {
   if (pet.isEgg() || pet.sleeping || pet.ceremony) return;
+#if DROID_PREVIEW
+  if (pet.onMission()) return;
+#endif
 #if BOARD_AMOLED_175C
   if (!trainingCaptureReady) { showControlToast("Touch capture unavailable"); return; }
   trainingCapture.reset();
@@ -2001,11 +2486,177 @@ void sackTap() {
   if (!timeLeft(sackUntil)) return;  // ya termino el tiempo
   sackHits++;
   sackShake = 16;  // sacude el saco
+#if DROID_PREVIEW
+  cargoTapAt = millis();
+#endif
 }
 
 void drawGameScene();  // prototipo (definida mas abajo)
+#if DROID_PREVIEW
+// ---------- TamaDroid: cargo lift (polished; replaces the punching bag look) ----------
+// The droid works a winch; every tap hauls the crate up the gantry crane for 10 s.
+#define CG_GROUND 392
+#define CG_CRATE_X 290
+
+static int cargoLift(uint16_t hits) { int v = hits * 5; return v > 196 ? 196 : v; }
+
+static void drawCrane(uint16_t ink) {
+  uint16_t steel = C565(0x8a, 0x8e, 0x98), steelHi = C565(0xc8, 0xcc, 0xd4), steelDk = C565(0x50, 0x54, 0x60);
+  for (int px : { 232, 342 }) {                       // posts with a highlight edge
+    gfx->fillRect(px, 104, 8, CG_GROUND - 104, steel);
+    gfx->fillRect(px, 104, 2, CG_GROUND - 104, steelHi);
+    gfx->fillRect(px + 6, 104, 2, CG_GROUND - 104, steelDk);
+    gfx->drawRect(px - 1, 103, 10, CG_GROUND - 102, ink);
+  }
+  for (int y = 112; y + 56 <= CG_GROUND - 6; y += 56) {  // cross bracing on the back, inside the posts
+    gfx->drawLine(240, y, 342, y + 56, steelDk);
+    gfx->drawLine(342, y, 240, y + 56, steelDk);
+  }
+  gfx->fillRect(222, 96, 134, 10, steel);             // top beam
+  gfx->fillRect(222, 96, 134, 2, steelHi);
+  gfx->drawRect(221, 95, 136, 12, ink);
+  gfx->fillRect(226, CG_GROUND - 4, 126, 6, steelDk); // footing
+}
+
+static void drawWinch(int cx, int baseY, uint16_t hits, uint16_t ink) {
+  uint16_t body = C565(0xd0, 0x8a, 0x2c), bodyDk = C565(0x96, 0x5c, 0x1a);
+  gfx->fillRoundRect(cx - 20, baseY - 34, 40, 34, 4, body);
+  gfx->fillRect(cx - 20, baseY - 12, 40, 12, bodyDk);
+  gfx->drawRoundRect(cx - 20, baseY - 34, 40, 34, 4, ink);
+  gfx->fillCircle(cx, baseY - 24, 9, C565(0x5a, 0x5e, 0x6a));   // drum
+  gfx->drawCircle(cx, baseY - 24, 9, ink);
+  float a = hits * 1.1f;                                         // crank turns with each tap
+  int hx = cx + (int)(14 * cosf(a)), hy = baseY - 24 + (int)(14 * sinf(a));
+  gfx->drawLine(cx, baseY - 24, hx, hy, ink);
+  gfx->fillCircle(hx, hy, 3, C565(0xe0, 0x40, 0x30));
+}
+
+static void drawTimerRing(uint32_t left, uint32_t total) {
+  const int N = 60;
+  int on = (int)((uint64_t)left * N / total);
+  for (int i = 0; i < N; i++) {
+    float ang = -1.5708f + i * 6.2832f / N;
+    int x = CX + (int)(220 * cosf(ang)), y = CY + (int)(220 * sinf(ang));
+    uint16_t c = UI_TRACK;
+    if (i < on) c = on > N / 2 ? UI_BAR_OK : (on > N / 5 ? UI_BAR_WARN : UI_BAR_BAD);
+    gfx->fillCircle(x, y, 3, c);
+  }
+}
+
+void renderCargo() {
+  uint32_t now = millis();
+  bool night = sceneHour() < 6 || sceneHour() >= 20;
+  uint16_t ink = UI_INK;
+  drawScene(0, now, night);
+
+  if (sackOverUntil) {
+    if (!timeLeft(sackOverUntil)) { sackOpen = false; return; }
+    blPanel(CX - 130, 128, 260, 176);
+    gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+    setSize(2);
+    setCur(centerX("WINCH PULLS", 2), 146);
+    printT("WINCH PULLS");
+    char b[8];
+    snprintf(b, sizeof(b), "%u", sackHits);
+    gfx->setTextColor(UI_WHITE);
+    setSize(6);
+    setCur(centerX(b, 6), 176);
+    printT(b);
+    setSize(2);
+    char g[18];
+    snprintf(g, sizeof(g), T(S_STR_GAIN_FMT), sackGain);
+    gfx->setTextColor(UI_BAR_OK);
+    setCur(centerX(g, 2), 238);
+    printT(g);
+    if (sackNewHi && sackHits > 0) {
+      gfx->setTextColor(UI_BAR_WARN);
+      setCur(centerX(T(S_NEW_RECORD), 2), 268);
+      printT(T(S_NEW_RECORD));
+    } else {
+      char r[18];
+      snprintf(r, sizeof(r), T(S_RECORD_FMT), pet.strHi);
+      gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+      setCur(centerX(r, 2), 268);
+      printT(r);
+    }
+    flushUI();
+    return;
+  }
+
+  if (!timeLeft(sackUntil)) {  // time's up: apply the training
+    sackNewHi = (sackHits > pet.strHi);
+    sackGain = pet.trainStrength(sackHits);
+    sfxPlay(sackNewHi ? SFX_MEDAL : SFX_PLAY);
+    sackOverUntil = now + 3500;
+    blSpawnSparks(CG_CRATE_X, CG_GROUND - 64 - cargoLift(sackHits), 14, C565(0xff, 0xe0, 0x80), UI_WHITE);
+    flushUI();
+    return;
+  }
+
+  // physics-ish: the crate eases towards its target height and jolts on each pull
+  sackShake *= 0.80f;
+  int jolt = (int)(sackShake * 0.25f * sinf(now * 0.09f));
+  int lift = cargoLift(sackHits);
+  int crateTop = CG_GROUND - 64 - lift + jolt;
+
+  drawCrane(ink);
+  // best-so-far marker
+  if (pet.strHi > 0) {
+    int by = CG_GROUND - 64 - cargoLift(pet.strHi);
+    for (int x = 244; x < 340; x += 10) gfx->fillRect(x, by, 6, 2, UI_BAR_WARN);
+    gfx->setTextColor(UI_BAR_WARN);
+    setSize(1);
+    setCur(350, by - 4);
+    printT("BEST");
+  }
+  // pulley and cables
+  drawIdx(GS_PULLEY, CG_CRATE_X - 16, 104, 2, false);
+  gfx->drawLine(CG_CRATE_X, 128, CG_CRATE_X, crateTop - 6, ink);
+  gfx->drawLine(CG_CRATE_X - 14, 116, 196, CG_GROUND - 24, ink);
+  gfx->fillRect(CG_CRATE_X - 6, crateTop - 8, 12, 8, C565(0x50, 0x54, 0x60));  // hook block
+  // crate (dust when it leaves the ground)
+  drawIdx(GS_CRATE, CG_CRATE_X - GS_CRATE.w, crateTop, 2, false);
+  if (sackHits == 1 && now - cargoTapAt < 60)
+    blSpawnSparks(CG_CRATE_X, CG_GROUND - 2, 10, C565(0xe8, 0xd0, 0xa0), C565(0xc8, 0xa8, 0x78));
+  // winch + droid cranking it
+  drawWinch(196, CG_GROUND, sackHits, ink);
+  if (pmd.loaded) {
+    bool working = now - cargoTapAt < 260;
+    uint8_t act = working && pmd.has(PMD_WALKR) ? PMD_WALKR : PMD_IDLE;
+    drawPmdAct(act, 128, CG_GROUND, now, true, false, 3);
+  }
+  if (now - cargoTapAt < 40) blSpawnSparks(196, CG_GROUND - 24, 3, C565(0xff, 0xd0, 0x60), UI_WHITE);
+  for (auto &s : blSparks) {
+    if ((int32_t)(s.until - now) <= 0) continue;
+    s.x += s.vx * 0.6f; s.y += s.vy * 0.6f; s.vy += 0.25f;
+    gfx->fillRect((int)s.x, (int)s.y, 3, 3, s.col);
+  }
+
+  // HUD: count panel, hint, and a ring of dots counting down the 10 s
+  blPanel(CX - 62, 24, 124, 50);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%u", sackHits);
+  gfx->setTextColor(UI_WHITE);
+  setSize(4);
+  setCur(centerX(buf, 4), 33);
+  printT(buf);
+  if (sackHits < 3) {
+    gfx->setTextColor(ink);
+    setSize(2);
+    setCur(centerX(T(S_HIT_FAST), 2), 80);
+    printT(T(S_HIT_FAST));
+  }
+  drawTimerRing(sackUntil - now, 10000);
+  flushUI();
+}
+#endif
+
 
 void renderSack() {
+#if DROID_PREVIEW
+  renderCargo();
+  return;
+#endif
   uint32_t now = millis();
   drawGameScene();  // fondo del habitat
   bool night = sceneHour() < 6 || sceneHour() >= 20;
@@ -2073,12 +2724,30 @@ void renderSack() {
   sackShake *= 0.84f;
   int off = (int)(sackShake * sinf(now * 0.05f));
   int sx = CX + off, top = 86, sy = 150;
+#if DROID_PREVIEW
+  // cargo lift: every tap hauls the crate a little higher on its cable
+  (void)top; (void)sy;
+  int lift = sackHits * 4 > 128 ? 128 : sackHits * 4;
+  int cy = 194 - lift;                                   // crate top (bottom stays above the counter)
+  uint16_t wood = C565(0xb0, 0x7a, 0x45), woodDk = C565(0x7e, 0x55, 0x30);
+  gfx->fillRect(CX - 60, 50, 120, 6, ink);               // gantry beam
+  gfx->fillRect(sx - 1, 56, 3, cy - 56, ink);            // cable
+  gfx->fillRect(sx - 8, cy - 8, 17, 8, ink);             // hook block
+  gfx->fillRect(sx - 42, cy, 84, 60, wood);              // crate
+  gfx->drawRect(sx - 42, cy, 84, 60, ink);
+  gfx->drawRect(sx - 41, cy + 1, 82, 58, woodDk);
+  for (int i = 0; i < 4; i++) {                          // X bracing
+    gfx->drawLine(sx - 38 + i, cy + 4, sx + 38 - 3 + i, cy + 56, woodDk);
+    gfx->drawLine(sx + 38 - i, cy + 4, sx - 38 + 3 - i, cy + 56, woodDk);
+  }
+#else
   gfx->fillRect(CX - 3, 56, 6, top - 56, ink);          // gancho/cuerda
   gfx->fillRect(sx - 4, top - 30, 8, 34, ink);          // cadena
   gfx->fillRoundRect(sx - 42, top, 84, 150, 26, C565(0xb5, 0x3a, 0x3a));  // saco
   gfx->fillRoundRect(sx - 42, top, 84, 22, 18, C565(0x7e, 0x28, 0x28));   // tapa
   gfx->drawRoundRect(sx - 42, top, 84, 150, 26, ink);
   gfx->fillRect(sx - 42, top + 70, 84, 4, C565(0x7e, 0x28, 0x28));        // costura
+#endif
 
   // contador de golpes
   char buf[8];
@@ -2130,11 +2799,18 @@ void drawGameScene() {
     for (auto &st : STARS) gfx->fillRect(st[0], st[1], 4, 4, UI_WHITE);
   uint8_t bio = pet.isEgg() ? 0 : DEX_TBL[pet.speciesId].biome;
   uint16_t soil = BIOME_SOIL[bio < 6 ? bio : 0];
+#if DROID_PREVIEW
+  soil = C565(0xe2, 0xbc, 0x82);  // Tatooine sand, like the main scene
+#endif
   if (night) soil = lerp565(soil, C565(0x16, 0x1c, 0x30), 9, 16);
   gfx->fillRect(0, hor, LCD_WIDTH, LCD_HEIGHT - hor, soil);
 }
 
 void renderGame() {
+#if DROID_PREVIEW
+  renderBlaster();
+  return;
+#endif
   // sin fillScreen(NEGRO): drawGameScene cubre la pantalla completa (LCD_WIDTH x LCD_HEIGHT). Si el
   // DMA del flush anterior aun lee el buffer, vera contenido valido (no negro
   // a medio pintar), que era el parpadeo a 25 fps.
@@ -2223,10 +2899,499 @@ void renderGame() {
   }
 
   // la pokeball
+#if DROID_PREVIEW
+  // training remote + its bolt (glowing head with a short tail)
+  drawMap(SPR_ICON_REMOTE, 16, (int)remoteX - 24, 108 - 24, 3, false);
+  if (boltLive) {
+    float sp = sqrtf(ballVX * ballVX + ballVY * ballVY);
+    float ux = sp > 0 ? ballVX / sp : 0, uy = sp > 0 ? ballVY / sp : 1;
+    uint16_t glow = boltBack ? C565(0x80, 0xd0, 0xff) : C565(0xff, 0x50, 0x40);
+    for (int i = 4; i >= 1; i--)
+      gfx->fillCircle((int)(ballX - ux * i * 7), (int)(ballY - uy * i * 7), 6 - i, glow);
+    gfx->fillCircle((int)ballX, (int)ballY, 7, glow);
+    gfx->fillCircle((int)ballX, (int)ballY, 3, UI_WHITE);
+  }
+#else
   drawMap(SPR_ICON_PLAY, 16, (int)ballX - 24, (int)ballY - 24, 3, false);
+#endif
 
   flushUI();
 }
+
+#if DROID_PREVIEW
+// ---------- TamaDroid: circuit repair (memory game) ----------
+// An open access panel: four lamps on a circuit board flash a sequence; repeat it.
+// Each round adds one step. A wrong lamp shorts the board.
+static const int16_t CIRC_PX[4] = { 0, 98, 0, -98 };   // up, right, down, left (offsets from centre)
+static const int16_t CIRC_PY[4] = { -84, 0, 84, 0 };
+#define CIRC_R 30
+static const uint16_t CIRC_GLOW[4] = { C565(0xff, 0x58, 0x48), C565(0xff, 0xde, 0x58), C565(0x58, 0xe8, 0x78), C565(0x68, 0xb8, 0xff) };
+
+static uint16_t circStepMs() { int v = 480 - circLen * 15; return v < 220 ? 220 : v; }
+
+static void circAddStep(uint32_t delayMs) {
+  if (circLen < sizeof(circSeq)) circSeq[circLen++] = random(4);
+  circPos = 0;
+  circPhase = 0;
+  circT0 = millis() + delayMs;
+}
+
+void startCircuit() {
+  if (pet.isEgg() || pet.sleeping || pet.ceremony || pet.onMission()) return;
+  circOpen = true;
+  circLen = 0;
+  circNewHi = false;
+  circOverUntil = 0;
+  circShortUntil = circOkUntil = circShakeUntil = 0;
+  circFlash = -1;
+  for (auto &s : blSparks) s.until = 0;
+  circAddStep(800);
+}
+
+static void circGameOver() {
+  uint16_t rounds = circLen ? circLen - 1 : 0;
+  circNewHi = rounds > pet.circHi;
+  pet.circuitResult(rounds);
+  sfxPlay(circNewHi && rounds > 0 ? SFX_MEDAL : SFX_LEVEL);
+  circPhase = 2;
+  uint32_t now = millis();
+  circShortUntil = now + 900;   // show the short circuit before the results panel
+  circShakeUntil = now + 350;
+  circOverUntil = now + 4500;
+  blSpawnSparks(CX, CY, 16, C565(0xff, 0xe0, 0x60), C565(0xff, 0x60, 0x40));
+}
+
+void circuitTap(int16_t x, int16_t y) {
+  if (circPhase == 2) return;
+  if (y < GAME_EXIT_Y) { circOpen = false; return; }
+  if (circPhase != 1) return;  // still showing the sequence
+  int pad = -1;
+  for (int i = 0; i < 4; i++) {
+    int dx = x - (CX + CIRC_PX[i]), dy = y - (CY + CIRC_PY[i]);
+    if (dx * dx + dy * dy <= (CIRC_R + 18) * (CIRC_R + 18)) { pad = i; break; }
+  }
+  if (pad < 0) return;
+  circFlash = pad;
+  circFlashUntil = millis() + 300;
+  if (pad != circSeq[circPos]) { circGameOver(); return; }
+  sfxPlay(SFX_TAP);
+  blSpawnSparks(CX + CIRC_PX[pad], CY + CIRC_PY[pad], 6, CIRC_GLOW[pad], UI_WHITE);
+  if (++circPos >= circLen) {
+    circOkUntil = millis() + 450;
+    if (circLen >= sizeof(circSeq)) circGameOver();  // finished every step
+    else circAddStep(900);
+  }
+}
+
+static void drawCircuitBoard(int ox, int oy, int lit, bool shorted) {
+  uint16_t plate = C565(0x5a, 0x60, 0x6c), plateHi = C565(0x8a, 0x90, 0x9c), plateDk = C565(0x3a, 0x3e, 0x48);
+  uint16_t pcb = shorted ? C565(0x5a, 0x24, 0x20) : C565(0x1c, 0x52, 0x30);
+  uint16_t copper = C565(0xc0, 0x9a, 0x48), copperDk = C565(0x80, 0x64, 0x2c);
+  // access panel plate with rivets
+  gfx->fillRoundRect(ox - 172, oy - 146, 344, 292, 26, plateDk);
+  gfx->fillRoundRect(ox - 170, oy - 144, 340, 288, 24, plate);
+  gfx->drawRoundRect(ox - 170, oy - 144, 340, 288, 24, plateHi);
+  for (int sx : { -150, 150 })
+    for (int sy : { -124, 124 }) {
+      gfx->fillCircle(ox + sx, oy + sy, 5, plateDk);
+      gfx->fillCircle(ox + sx - 1, oy + sy - 1, 3, plateHi);
+    }
+  // circuit board
+  gfx->fillRoundRect(ox - 142, oy - 118, 284, 236, 14, pcb);
+  gfx->drawRoundRect(ox - 142, oy - 118, 284, 236, 14, copperDk);
+  // decorative traces + pads in the corners
+  const int16_t deco[][4] = { { -128, -100, -70, -100 }, { -70, -100, -70, -60 }, { 128, -100, 70, -100 }, { 70, -100, 70, -60 },
+                             { -128, 100, -70, 100 }, { -70, 100, -70, 60 }, { 128, 100, 70, 100 }, { 70, 100, 70, 60 } };
+  for (auto &d : deco) gfx->drawLine(ox + d[0], oy + d[1], ox + d[2], oy + d[3], copperDk);
+  for (int sx : { -70, 70 })
+    for (int sy : { -60, 60 }) { gfx->fillCircle(ox + sx, oy + sy, 4, copper); gfx->fillCircle(ox + sx, oy + sy, 1, pcb); }
+  // main traces: chip to each lamp, doubled for weight; the lit one glows
+  for (int i = 0; i < 4; i++) {
+    uint16_t c = (i == lit) ? CIRC_GLOW[i] : copper;
+    int lx = ox + CIRC_PX[i], ly = oy + CIRC_PY[i];
+    if (CIRC_PX[i] == 0) { gfx->fillRect(lx - 2, (ly < oy ? ly : oy), 5, abs(ly - oy), c); }
+    else { gfx->fillRect((lx < ox ? lx : ox), ly - 2, abs(lx - ox), 5, c); }
+  }
+  // lamps with a bloom when lit
+  for (int i = 0; i < 4; i++) {
+    int lx = ox + CIRC_PX[i], ly = oy + CIRC_PY[i];
+    if (i == lit) {
+      gfx->fillCircle(lx, ly, CIRC_R + 14, lerp565(pcb, CIRC_GLOW[i], 5, 16));
+      gfx->fillCircle(lx, ly, CIRC_R + 8, lerp565(pcb, CIRC_GLOW[i], 9, 16));
+    }
+    const IdxSprite &sp = *GS_LAMPS[i][i == lit ? 1 : 0];
+    drawIdx(sp, lx - sp.w, ly - sp.h, 2, false);
+  }
+  // centre chip with the round number
+  drawIdx(GS_CHIP, ox - GS_CHIP.w, oy - GS_CHIP.h, 2, false);
+  char n[6];
+  snprintf(n, sizeof(n), "%u", circLen);
+  gfx->setTextColor(UI_WHITE);
+  setSize(3);
+  setCur(ox - textW(n, 3) / 2, oy - 11);
+  printT(n);
+}
+
+void renderCircuit() {
+  uint32_t now = millis();
+  bool night = sceneHour() < 6 || sceneHour() >= 20;
+  drawScene(0, now, night);
+
+  if (circPhase == 2 && !timeLeft(circShortUntil)) {
+    if (!timeLeft(circOverUntil)) { circOpen = false; return; }
+    blPanel(CX - 130, 128, 260, 176);
+    gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+    setSize(2);
+    setCur(centerX("ROUNDS REPAIRED", 2), 146);
+    printT("ROUNDS REPAIRED");
+    char b[8];
+    snprintf(b, sizeof(b), "%u", circLen ? circLen - 1 : 0);
+    gfx->setTextColor(UI_WHITE);
+    setSize(6);
+    setCur(centerX(b, 6), 176);
+    printT(b);
+    setSize(2);
+    if (circNewHi && circLen > 1) {
+      gfx->setTextColor(UI_BAR_WARN);
+      setCur(centerX(T(S_NEW_RECORD), 2), 238);
+      printT(T(S_NEW_RECORD));
+    } else {
+      char r[20];
+      snprintf(r, sizeof(r), T(S_RECORD_FMT), pet.circHi);
+      gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+      setCur(centerX(r, 2), 238);
+      printT(r);
+    }
+    gfx->setTextColor(UI_BAR_OK);
+    setCur(centerX("Circuits patched!", 2), 270);
+    printT("Circuits patched!");
+    flushUI();
+    return;
+  }
+
+  // which lamp is on right now
+  int lit = -1;
+  if (circPhase == 0) {
+    int32_t el = (int32_t)(now - circT0);
+    if (el >= 0) {
+      uint32_t slot = circStepMs() + 160;
+      uint32_t idx = (uint32_t)el / slot;
+      if (idx >= circLen) { circPhase = 1; circPos = 0; }
+      else if ((uint32_t)el % slot < circStepMs()) lit = circSeq[idx];
+    }
+  }
+  // the tapped lamp stays lit for its flash even after the last press of a round,
+  // while the next sequence is waiting to start
+  if (lit < 0 && circFlash >= 0 && timeLeft(circFlashUntil)) lit = circFlash;
+
+  bool shorted = circPhase == 2;  // still inside the short-circuit window
+  int ox = CX, oy = CY + 16;
+  if (timeLeft(circShakeUntil)) { ox += (int)random(11) - 5; oy += (int)random(7) - 3; }
+  drawCircuitBoard(ox, oy, shorted ? -1 : lit, shorted);
+
+  // round complete: green ring round the chip
+  if (timeLeft(circOkUntil))
+    for (int r = 0; r < 3; r++) gfx->drawCircle(ox, oy, 36 + r, UI_BAR_OK);
+
+  for (auto &s : blSparks) {
+    if ((int32_t)(s.until - now) <= 0) continue;
+    s.x += s.vx * 0.6f; s.y += s.vy * 0.6f; s.vy += 0.2f;
+    gfx->fillRect((int)s.x, (int)s.y, 3, 3, s.col);
+  }
+
+  // prompt panel with a status LED, and step LEDs along the bottom of the plate
+  blPanel(CX - 84, 24, 168, 46);
+  const char *p = shorted ? "SHORT!" : (circPhase == 0 ? "WATCH" : "REPEAT");
+  uint16_t led = shorted ? UI_BAR_BAD : (circPhase == 0 ? UI_BAR_WARN : UI_BAR_OK);
+  gfx->fillCircle(CX - 62, 47, 6, led);
+  gfx->setTextColor(UI_WHITE);
+  setSize(3);
+  setCur(CX - 46, 36);
+  printT(p);
+  int shown = circLen > 12 ? 12 : circLen;
+  for (int i = 0; i < shown; i++) {
+    int x = CX - (shown - 1) * 9 + i * 18;
+    bool done = circPhase == 1 && i < circPos;
+    gfx->fillCircle(x, oy + 132, 4, done ? UI_BAR_OK : C565(0x30, 0x34, 0x3c));
+  }
+  flushUI();
+}
+#endif
+
+#if DROID_PREVIEW
+// ---------- TamaDroid: salvage missions (picker, away sign, report) ----------
+static const char *const MIS_NAME[MISSION_COUNT] = {
+  "DUNE SCOUTING", "MOISTURE HAUL", "VAPORATOR REPAIR", "JAWA TRADE RUN", "TUSKEN TERRITORY", "SANDCRAWLER SALVAGE" };
+static const char *const MIS_RISK[MISSION_COUNT] = { "LOW RISK", "LOW RISK", "MED RISK", "MED RISK", "HIGH RISK", "HIGH RISK" };
+static const char *const PART_NAME[PART_COUNT] = { "SENSOR", "SERVO", "PLATING", "COUPLING", "HOLO-PROJ" };
+static const char *const MIS_TITLE[4] = { "GREAT RUN!", "JOB DONE", "ROUGH TRIP", "FAILED" };
+// [job][outcome][line]; '|' breaks the line
+static const char *const MIS_LOG[MISSION_COUNT][4][3] = {
+  { { "Mapped three dunes,|found a buried crate!", "Outran a sandstorm|with time to spare.", "Spotted a krayt trail|and logged it." },
+    { "Scouted the ridge|beeping all the way.", "Found an old sensor|half buried in sand.", "Charted a safe path|for the farmers." },
+    { "Got lost in the dunes|for a while.", "Sand in every joint.|Every. Joint.", "Tumbled down a dune|but kept going." },
+    { "Sandstorm. Came back|scrubbed and sulking.", "Stuck in a sand pit|until a Jawa helped.", "Chased off by a womp|rat. Embarrassing." } },
+  { { "Hauled twice the load.|The farmer tipped!", "Carried every canister|without a scratch.", "Fastest haul on the|homestead this season." },
+    { "Delivered the water|right on time.", "Heavy cargo, steady|wheels. Job done.", "The farmer gave it|a friendly pat." },
+    { "Dropped a canister.|Mostly saved it.", "Wheels overheated|halfway there.", "Took the long way|around a rock." },
+    { "Tipped the whole load|into the sand.", "Servo seized. Had to|be towed home.", "Rolled into a ditch.|Water everywhere." } },
+  { { "Fixed the vaporator|AND tuned two more.", "Rewired it perfectly.|It hums now.", "Found a spare coupling|in the housing!" },
+    { "Vaporator fixed.|Moisture flowing.", "Swapped a fried coil.|Good as new.", "Patched a leak in|the condenser." },
+    { "Fixed it after a|few small zaps.", "The repair held...|barely.", "Got stuck up the|tower for an hour." },
+    { "Short circuit! Came|back smoking a bit.", "Made it worse.|Much worse.", "Zapped by the|condenser. Ouch." } },
+  { { "Out-haggled the Jawas!|Utinni indeed.", "Traded junk for|real treasure.", "The Jawas threw in|a bonus part!" },
+    { "Fair trade with|the Jawas today.", "Came back with parts|and a strange smell.", "Swapped scrap for|a working servo." },
+    { "Jawas drove a hard|bargain. Barely even.", "Nearly got sold|by mistake.", "Lost its way back|from the sandcrawler." },
+    { "Jawas took the parts|and tried to keep it.", "Ion blast from a Jawa.|Rebooted twice.", "Traded everything|for a broken lamp." } },
+  { { "Slipped past the|Tuskens unseen!", "Salvaged a wreck in|Tusken land. Bold.", "Dodged a gaffi stick|and grabbed the loot." },
+    { "Got in, got the|plating, got out.", "The Tuskens spotted it|too late.", "Sneaked through the|canyon. Nicely done." },
+    { "Tuskens gave chase.|Escaped with dents.", "Hid in a crevice|for hours.", "A bantha sat on it.|Briefly." },
+    { "Tuskens took a swing|at it. Ran home.", "Chased off by a|Tusken raiding party.", "Came back dented|and empty-handed." } },
+  { { "Raided the crawler's|scrap bins. Jackpot!", "Found a holo-projector|under the junk!", "Best haul ever.|The Jawas never knew." },
+    { "Picked through the|crawler's junk pile.", "Good salvage, only|small scratches.", "Came back loaded|with parts." },
+    { "Got locked in the|cargo hold for a bit.", "Nearly got melted|down. Close one.", "Found mostly junk.|Some good bits." },
+    { "Captured by Jawas!|Escaped, barely.", "Fell down the|ore smelter chute.", "Caught by the crawler|crew. Ran for it." } },
+};
+
+// prints "a|b" as two centred lines
+static void printTwoLines(const char *s, int y, uint8_t size, uint16_t col) {
+  char a[40], b[40];
+  const char *bar = strchr(s, '|');
+  if (bar) {
+    size_t n = (size_t)(bar - s) < sizeof(a) - 1 ? (size_t)(bar - s) : sizeof(a) - 1;
+    memcpy(a, s, n); a[n] = 0;
+    snprintf(b, sizeof(b), "%s", bar + 1);
+  } else { snprintf(a, sizeof(a), "%s", s); b[0] = 0; }
+  gfx->setTextColor(col);
+  setSize(size);
+  setCur(centerX(a, size), y);
+  printT(a);
+  if (b[0]) { setCur(centerX(b, size), y + 10 * size); printT(b); }
+}
+
+static const char *misUses(uint8_t job) {
+  const MissionDef &m = MISSIONS[job];
+  if (m.wAtk && m.wDef && m.wSpe) return "USES ALL STATS";
+  if (m.wDef && m.wSpe) return "USES ARM + SPD";
+  if (m.wAtk && m.wSpe) return "USES STR + SPD";
+  if (m.wAtk) return "USES STR";
+  if (m.wDef) return "USES ARM";
+  return "USES SPD";
+}
+
+// salvage crate (replaces the egg): rattles, dents with each tap, the lid springs open
+void drawCrate(uint8_t taps) {
+  uint32_t now = millis();
+  int s = 4, w = GS_CRATE.w * s, h = GS_CRATE.h * s;
+  int jig = (int)(taps * 1.5f * sinf(now * 0.02f));          // rattles more as it gives way
+  if ((now / 1700) % 2 == 0 && (now % 1700) < 240) jig += (int)(3 * sinf(now * 0.08f));  // idle shiver
+  int x = CX - w / 2 + jig, y = PET_GROUND - h;
+  uint16_t ink = UI_INK, glow = C565(0xff, 0xe0, 0x80);
+  gfx->fillRoundRect(CX - w / 2 - 6, PET_GROUND - 4, w + 12, 10, 5, lerp565(C565(0xe2, 0xbc, 0x82), ink, 4, 16));  // shadow
+  if (taps >= 2) {  // lid ajar: light spills out of the gap
+    gfx->fillRect(x + 8, y - 6, w - 16, 8, glow);
+    for (int i = 0; i < 5; i++) gfx->drawLine(x + 20 + i * 30, y - 8, x + 10 + i * 34, y - 30 - (i % 2) * 10, glow);
+  }
+  drawIdx(GS_CRATE, x, y + (taps >= 2 ? 6 : 0), s, false);
+  if (taps >= 1) {  // dents and a popped strap
+    int yy = y + (taps >= 2 ? 6 : 0);
+    gfx->drawLine(x + 22, yy + 30, x + 40, yy + 52, ink);
+    gfx->drawLine(x + 40, yy + 52, x + 30, yy + 70, ink);
+    gfx->drawLine(x + w - 30, yy + 18, x + w - 44, yy + 40, ink);
+    gfx->fillRect(x + w - 50, yy - 4, 14, 6, C565(0x96, 0x9a, 0xa6));
+  }
+  if (taps >= 2) {  // lid prised up on the right
+    uint16_t lid = C565(0x96, 0x70, 0x46);
+    int lx0 = x - 4, ly0 = y + 4, lx1 = x + w + 6, ly1 = y - 20;
+    gfx->fillTriangle(lx0, ly0, lx1, ly1, lx1, ly1 + 10, lid);
+    gfx->fillTriangle(lx0, ly0, lx1, ly1 + 10, lx0, ly0 + 10, lid);
+    gfx->drawLine(lx0, ly0, lx1, ly1, ink);
+    gfx->drawLine(lx0, ly0 + 10, lx1, ly1 + 10, ink);
+    gfx->drawLine(lx1, ly1, lx1, ly1 + 10, ink);
+  }
+}
+
+void drawAway() {
+  // wooden sign where the droid usually stands, tracks leading off over the dunes
+  bool night = gNight;
+  uint16_t wood = night ? C565(0x5a, 0x44, 0x30) : C565(0xa8, 0x7c, 0x4c);
+  uint16_t woodDk = night ? C565(0x3a, 0x2c, 0x20) : C565(0x72, 0x52, 0x30);
+  for (int i = 0; i < 9; i++) {  // tracks
+    int x = CX + 30 + i * 22, y = 300 - i * 6;
+    gfx->fillRect(x, y, 6, 3, woodDk);
+    gfx->fillRect(x + 4, y + 6, 6, 3, woodDk);
+  }
+  gfx->fillRect(CX - 4, 250, 8, 62, woodDk);  // post
+  gfx->fillRoundRect(CX - 110, 190, 220, 66, 8, wood);
+  gfx->drawRoundRect(CX - 110, 190, 220, 66, 8, woodDk);
+  gfx->drawRoundRect(CX - 108, 192, 216, 62, 7, woodDk);
+  for (int nx : { CX - 100, CX + 96 }) gfx->fillRect(nx, 218, 4, 4, woodDk);  // nails
+  // the header already says "Out on a mission": the sign just names the job and the time
+  static const char *const SIGN[MISSION_COUNT] = {
+    "DUNE SCOUT", "MOISTURE HAUL", "VAPORATOR", "JAWA TRADE", "TUSKEN LAND", "SANDCRAWLER" };
+  uint8_t job = (uint8_t)pet.missionJob;
+  uint16_t cream = C565(0xff, 0xf4, 0xd8);
+  gfx->setTextColor(cream);
+  setSize(2);
+  setCur(centerX(SIGN[job], 2), 202);
+  printT(SIGN[job]);
+  char b[20];
+  if (pet.missionLeft <= 1) snprintf(b, sizeof(b), "BACK ANY MINUTE");
+  else snprintf(b, sizeof(b), "BACK IN %u MIN", pet.missionLeft);
+  gfx->fillRect(CX - 80, 224, 160, 2, woodDk);  // divider
+  setCur(centerX(b, 2), 232);
+  printT(b);
+}
+
+void renderMissionPick() {
+  uint32_t now = millis();
+  drawScene(0, now, sceneHour() < 6 || sceneHour() >= 20);
+  bool away = pet.onMission();
+  uint8_t j = away ? (uint8_t)pet.missionJob : misSel;
+  const MissionDef &m = MISSIONS[j];
+
+  blPanel(CX - 84, 24, 168, 44);
+  gfx->setTextColor(UI_WHITE);
+  setSize(3);
+  setCur(centerX("MISSIONS", 3), 35);
+  printT("MISSIONS");
+
+  blPanel(CX - 132, 82, 264, 238);
+  gfx->setTextColor(UI_WHITE);
+  setSize(2);
+  setCur(centerX(MIS_NAME[j], 2), 96);
+  printT(MIS_NAME[j]);
+  char b[32];
+  snprintf(b, sizeof(b), "%u MIN  %s", m.minutes, MIS_RISK[j]);
+  uint16_t riskCol = j >= 4 ? UI_BAR_BAD : (j >= 2 ? UI_BAR_WARN : UI_BAR_OK);
+  gfx->setTextColor(riskCol);
+  setCur(centerX(b, 2), 122);
+  printT(b);
+  gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+  setCur(centerX(misUses(j), 2), 148);
+  printT(misUses(j));
+
+  // odds, or why it can't go
+  const char *odds;
+  uint16_t oc;
+  if (away) { snprintf(b, sizeof(b), "BACK IN %u MIN", pet.missionLeft); odds = b; oc = UI_BAR_WARN; }
+  else if (pet.level() < m.minLevel) { snprintf(b, sizeof(b), "UNLOCKS AT LV.%u", m.minLevel); odds = b; oc = UI_TRACK; }
+  else if (pet.sleeping) { odds = "POWERED DOWN"; oc = UI_TRACK; }
+  else if (pet.energy < 30 || pet.hygiene < 30) { odds = "NEEDS SYS+OIL 30"; oc = UI_BAR_BAD; }
+  else {
+    int margin = (int)pet.missionScore(j, 20) - (int)m.difficulty;
+    odds = margin >= 25 ? "ODDS: GREAT" : margin >= 5 ? "ODDS: GOOD" : margin >= -15 ? "ODDS: FAIR" : "ODDS: RISKY";
+    oc = margin >= 5 ? UI_BAR_OK : margin >= -15 ? UI_BAR_WARN : UI_BAR_BAD;
+  }
+  gfx->setTextColor(oc);
+  setSize(2);
+  setCur(centerX(odds, 2), 176);
+  printT(odds);
+
+  // what it can find
+  gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+  setSize(1);
+  setCur(CX - 96, 214);
+  printT("FINDS");
+  drawIdx(*GS_PARTS[m.partA], CX - 50, 204, 2, false);
+  if (m.partB != m.partA) drawIdx(*GS_PARTS[m.partB], CX - 10, 204, 2, false);
+  if (m.holoChance) drawIdx(GS_PART_HOLO, CX + 30, 204, 2, false);
+
+  // parts bin
+  gfx->drawLine(CX - 110, 248, CX + 110, 248, C565(0x4a, 0x58, 0x80));
+  setSize(1);
+  setCur(CX - 110, 256);
+  printT("PARTS BIN");
+  for (int i = 0; i < PART_COUNT; i++) {
+    int x = CX - 112 + i * 46;
+    drawIdx(*GS_PARTS[i], x, 270, 1, pet.parts[i] == 0);
+    snprintf(b, sizeof(b), "%u", pet.parts[i]);
+    gfx->setTextColor(UI_WHITE);
+    setSize(2);
+    setCur(x + 18, 272);
+    printT(b);
+  }
+
+  // arrows + send button
+  if (!away) {
+    for (int s : { -1, 1 }) {
+      int ax = CX + s * 172;
+      gfx->fillCircle(ax, 200, 20, C565(0x1e, 0x26, 0x46));
+      gfx->drawCircle(ax, 200, 20, UI_WHITE);
+      gfx->setTextColor(UI_WHITE);
+      setSize(3);
+      setCur(ax - 8, 189);
+      printT(s < 0 ? "<" : ">");
+    }
+  }
+  bool can = !away && pet.canStartMission(j);
+  uint16_t bc = away ? C565(0x4a, 0x58, 0x80) : can ? UI_BAR_OK : UI_TRACK;
+  gfx->fillRoundRect(CX - 80, 334, 160, 44, 12, bc);
+  gfx->drawRoundRect(CX - 80, 334, 160, 44, 12, UI_WHITE);
+  const char *bl = away ? "OK" : "SEND";
+  gfx->setTextColor(UI_WHITE);
+  setSize(3);
+  setCur(centerX(bl, 3), 345);
+  printT(bl);
+  flushUI();
+}
+
+void missionPickTap(int16_t x, int16_t y) {
+  bool away = pet.onMission();
+  if (y < GAME_EXIT_Y) { misPickOpen = false; return; }
+  if (y >= 330 && y <= 384 && x >= CX - 84 && x <= CX + 84) {
+    if (away) { misPickOpen = false; return; }
+    if (pet.startMission(misSel)) { sfxPlay(SFX_PLAY); misPickOpen = false; }
+    return;
+  }
+  if (away) return;
+  if (x < CX - 132) misSel = (misSel + MISSION_COUNT - 1) % MISSION_COUNT;
+  else if (x > CX + 132) misSel = (misSel + 1) % MISSION_COUNT;
+}
+
+void renderMissionReport() {
+  uint32_t now = millis();
+  drawScene(0, now, sceneHour() < 6 || sceneHour() >= 20);
+  uint8_t j = pet.repJob >= 0 ? (uint8_t)pet.repJob : 0;
+  uint8_t o = pet.repOutcome < 4 ? pet.repOutcome : 3;
+  blPanel(CX - 150, 70, 300, 290);
+  uint16_t tc = o == MIS_GREAT ? UI_BAR_WARN : o == MIS_SUCCESS ? UI_BAR_OK : o == MIS_ROUGH ? C565(0xa8, 0xb8, 0xe0) : UI_BAR_BAD;
+  gfx->setTextColor(tc);
+  setSize(3);
+  setCur(centerX(MIS_TITLE[o], 3), 88);
+  printT(MIS_TITLE[o]);
+  gfx->setTextColor(C565(0xa8, 0xb8, 0xe0));
+  setSize(2);
+  setCur(centerX(MIS_NAME[j], 2), 124);
+  printT(MIS_NAME[j]);
+  printTwoLines(MIS_LOG[j][o][pet.repLine % 3], 160, 2, UI_WHITE);
+  gfx->drawLine(CX - 120, 214, CX + 120, 214, C565(0x4a, 0x58, 0x80));
+  int found = (pet.repParts[0] < PART_COUNT) + (pet.repParts[1] < PART_COUNT);
+  if (!found) {
+    gfx->setTextColor(UI_TRACK);
+    setSize(2);
+    setCur(centerX("NO PARTS FOUND", 2), 250);
+    printT("NO PARTS FOUND");
+  } else {
+    int idx = 0;
+    for (uint8_t p : pet.repParts) {
+      if (p >= PART_COUNT) continue;
+      int cx = found == 1 ? CX : CX - 64 + idx * 128;
+      drawIdx(*GS_PARTS[p], cx - 16, 228, 2, false);
+      gfx->setTextColor(UI_WHITE);
+      setSize(1);
+      setCur(cx - textW(PART_NAME[p], 1) / 2, 266);
+      printT(PART_NAME[p]);
+      idx++;
+    }
+  }
+  gfx->setTextColor(C565(0x80, 0x90, 0xb8));
+  setSize(1);
+  setCur(centerX("tap to continue", 1), 330);
+  printT("tap to continue");
+  flushUI();
+}
+#endif
 
 // ---------- ficha del bicho (deslizar vertical) ----------
 
@@ -2299,6 +3464,7 @@ void drawClockBtn(int x, int y, const char *l) {
 #define LANG_PILL_W 96
 #define SND_PILL_X (34 + UI_DX)          // pildora de sonido (cicla alto, medio, bajo y apagado)
 #define SND_PILL_W 96
+#define POWER_PILL (HAS_DEEP_SLEEP && !HAS_AUDIO)  // left pill = power off instead of sound
 #define BRI_PILL_X (183 + UI_DX)         // pildora de brillo, centrada (cicla los niveles al tocar)
 #define BRI_PILL_W 100
 static const char *const LANG_CODES[LANG_COUNT] = { "ES", "EN", "FR", "DE", "IT", "PT", "JA", "KO", "NL" };
@@ -2337,6 +3503,24 @@ void renderClock() {
   setCur(276 + UI_DX, 256);
   printT(T(S_MIN));
 
+#if POWER_PILL
+  // no audio on this board: the left pill is "power off" (deep sleep, shake to wake)
+  gfx->fillRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, UI_WHITE);
+  gfx->drawRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, UI_INK);
+  {
+    int px = SND_PILL_X + 22, py = LANG_PILL_Y + LANG_PILL_H / 2 + 1;
+    for (int r = 8; r <= 9; r++)            // power symbol: ring open at the top...
+      for (int a = 40; a <= 320; a += 4) {
+        float t = (a - 90) * DEG_TO_RAD;
+        gfx->drawPixel(px + (int)roundf(r * cosf(t)), py + (int)roundf(r * sinf(t)), UI_BAR_BAD);
+      }
+    gfx->fillRect(px - 1, py - 11, 3, 10, UI_BAR_BAD);  // ...and the bar through the gap
+    gfx->setTextColor(UI_INK);
+    setSize(2);
+    setCur(SND_PILL_X + 40, LANG_PILL_Y + 8);
+    printT("OFF");
+  }
+#else
   // sonido (izquierda de la fila): un altavoz y tres barras con el volumen, o una X si esta apagado
   gfx->fillRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, UI_WHITE);
   gfx->drawRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, UI_INK);
@@ -2354,6 +3538,7 @@ void renderClock() {
       }
     }
   }
+#endif
 
   // nivel de brillo (centro de la fila): un sol y tres barras, las encendidas son el nivel
   gfx->fillRoundRect(BRI_PILL_X, LANG_PILL_Y, BRI_PILL_W, LANG_PILL_H, 8, UI_WHITE);
@@ -2408,6 +3593,13 @@ void clockTap(int16_t x, int16_t y) {
     return;
   }
   if (y >= LANG_PILL_Y && y <= LANG_PILL_Y + LANG_PILL_H) {
+#if POWER_PILL
+    if (x >= SND_PILL_X && x < SND_PILL_X + SND_PILL_W) {  // power off: deep sleep, shake to wake
+      clockOpen = false;  // wake up on the pet screen, not in settings
+      deepSleepNow("menu");
+      return;             // only reached if sleep could not be armed
+    }
+#endif
     if (x >= SND_PILL_X && x < SND_PILL_X + SND_PILL_W) {  // cicla sonido: alto, medio, bajo, apagado
       if (!audioEnabled()) {
         audioSetVolume(0);
@@ -2535,13 +3727,18 @@ void renderCardProfile() {
 
   drawCardStat(258, T(S_VIN), pet.bond, 100, C565(0xd4, 0x52, 0x7e));
 
+  char info[48];
+#if DROID_PREVIEW
+  snprintf(info, sizeof(info), "MISSIONS %u   AGE %lud", pet.missionsDone,
+           (unsigned long)(pet.ageMinutes / 1440));
+#else
   const char *berry = !pet.berryKnown ? T(S_BERRY_UNK)
                       : pet.lovesBerry(0) ? T(S_BERRY_RED)
                       : pet.lovesBerry(1) ? T(S_BERRY_BLUE)
                                           : T(S_BERRY_GREEN);
-  char info[48];
   snprintf(info, sizeof(info), T(S_INFO_FMT), berry,
            (unsigned long)(pet.ageMinutes / 1440));
+#endif
   gfx->setTextColor(UI_INK);
   setSize(2);
   setCur(centerX(info, 2), 296);
@@ -3171,6 +4368,25 @@ void drawBath() {
   }
   uint32_t left = bathUntil - now;
   if (left > 800) {
+#if DROID_PREVIEW
+    // oil bath: amber drops run down over the droid and pool at its feet
+    uint16_t oil = C565(0xd8, 0x8a, 0x2a), oilHi = C565(0xff, 0xd0, 0x80), oilDk = C565(0x8a, 0x52, 0x18);
+    uint32_t el = 3000 - left;
+    for (auto &b : bubbles) {
+      int bx = b.x + (b.ph % 5) - 2;
+      int by = (b.y - 70) + (int)((el + b.ph * 37) % 900) / 5;  // falling, staggered
+      int r = 3 + b.r / 6;
+      if (by > PET_GROUND - 8) continue;                         // landed in the puddle
+      gfx->fillCircle(bx, by, r, oil);
+      gfx->fillRect(bx - 1, by - r - 4, 3, 5, oil);              // drip tail
+      gfx->fillRect(bx - r / 2, by - r / 2, 2, 2, oilHi);        // shine
+    }
+    int pw = 30 + (int)(el / 40);                                 // puddle grows
+    if (pw > 100) pw = 100;
+    int px = (int)beh.x;
+    gfx->fillRoundRect(px - pw, PET_GROUND - 6, pw * 2, 10, 5, oilDk);
+    gfx->fillRoundRect(px - pw + 6, PET_GROUND - 5, pw, 3, 2, oil);
+#else
     // espuma: pompas meciendose y subiendo poco a poco
     float t = now / 220.0f;
     for (auto &b : bubbles) {
@@ -3180,6 +4396,7 @@ void drawBath() {
       gfx->drawCircle(bx, by, b.r, 0x7E3D);
       gfx->fillCircle(bx - b.r / 3, by - b.r / 3, b.r / 4, UI_BG_DAY);
     }
+#endif
   } else {
     // las pompas revientan: destellos
     for (int i = 0; i < 8; i++) {
@@ -3370,16 +4587,51 @@ void overlayMouth(const Species &sp, int x, int y, int s, bool open) {
 
 void drawPoops() {
   for (int i = 0; i < pet.poops; i++) {
+#if DROID_PREVIEW
+    drawMap(SPR_OIL_PUDDLE, 32, 36 + i * 46, 244, 2, false);
+#else
     drawMap(SPR_POOP, 32, 36 + i * 46, 244, 2, false);
+#endif
   }
 }
 
+#if DROID_PREVIEW
+// TamaDroid: an icon in front of each bar instead of a text label
+void drawIconBar(int x, int y, const char *const *icon, uint8_t val) {
+  drawMap(icon, 8, x, y, 2, false);  // 16x16 px, same height as the bar
+  const int bx = x + 24, bw = 118, bh = 15;
+  uint16_t fill = (val >= 50) ? UI_BAR_OK : (val >= 25) ? UI_BAR_WARN : UI_BAR_BAD;
+  gfx->fillRoundRect(bx, y, bw, bh, 4, UI_TRACK);
+  int fw = (bw - 4) * val / 100;
+  if (fw > 0) gfx->fillRoundRect(bx + 2, y + 2, fw, bh - 4, 3, fill);
+}
+
+// set DROID_BAR_ICONS to 1 for icons in front of the bars instead of text labels
+#ifndef DROID_BAR_ICONS
+#define DROID_BAR_ICONS 0
+#endif
+void drawBar(int x, int y, const char *label, uint8_t val);
+void drawBars() {
+#if DROID_BAR_ICONS
+  drawIconBar(78 + UI_DX, 318, SPR_BAR_CHARGE, pet.fullness);
+  drawIconBar(244 + UI_DX, 318, SPR_BAR_MORALE, pet.joy);
+  drawIconBar(78 + UI_DX, 346, SPR_BAR_ENERGY, pet.energy);
+  drawIconBar(244 + UI_DX, 346, SPR_BAR_MAINT, pet.hygiene);
+#else
+  drawBar(78 + UI_DX, 318, T(S_BAR_FOOD), pet.fullness);
+  drawBar(244 + UI_DX, 318, T(S_BAR_JOY), pet.joy);
+  drawBar(78 + UI_DX, 346, T(S_BAR_ENE), pet.energy);
+  drawBar(244 + UI_DX, 346, T(S_BAR_HYG), pet.hygiene);
+#endif
+}
+#else
 void drawBars() {
   drawBar(78 + UI_DX, 318, T(S_BAR_FOOD), pet.fullness);
   drawBar(244 + UI_DX, 318, T(S_BAR_JOY), pet.joy);
   drawBar(78 + UI_DX, 346, T(S_BAR_ENE), pet.energy);
   drawBar(244 + UI_DX, 346, T(S_BAR_HYG), pet.hygiene);
 }
+#endif
 
 // Separacion entre la etiqueta y su barra en la fila de necesidades. Estaba fija
 // en 48 px, justo lo que ocupan 4 letras latinas a escala 2, sin margen. Las
@@ -3436,6 +4688,9 @@ const char *eggMsg() {
 }
 
 const char *statusMsg() {
+#if DROID_PREVIEW
+  if (pet.onMission()) return "Out on a mission";
+#endif
   if (pet.evolving()) return T(S_EVOLVING);
   if (bathUntil) return "Splish splash!";  // onomatopeya universal
   if (pet.sleeping) return "Zzz...";

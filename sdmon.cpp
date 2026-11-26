@@ -1,5 +1,9 @@
 #include "sdmon.h"
 #include "pin_config.h"
+#include "droid.h"
+#if DROID_PREVIEW
+#include "builtin_sprites.h"
+#endif
 #include <FS.h>
 #if BOARD_AMOLED_175C
 #include <LittleFS.h>
@@ -21,28 +25,54 @@ bool sdReady = false;
 bool sdDirty = false;
 SdThumbs thumbs;
 
-bool PmdMon::load(uint8_t dexNum, bool shiny) {
-  unload();
-  if (!sdReady) return false;
-
-  char path[28];
-  snprintf(path, sizeof(path), "/mons/p%s%03u.bin", shiny ? "s" : "", dexNum);
+// Loads a TPK2 blob from the sprite store into PSRAM. false = not found/bad.
+static uint8_t *readSpriteFile(uint8_t dexNum, bool shiny, uint32_t &size, char *path, size_t pathLen) {
+  if (!sdReady) return nullptr;
+  snprintf(path, pathLen, "/mons/p%s%03u.bin", shiny ? "s" : "", dexNum);
   File f = SpriteFS.open(path, FILE_READ);
   if (!f && shiny) {  // sin shiny PMD: usa el normal
-    snprintf(path, sizeof(path), "/mons/p%03u.bin", dexNum);
+    snprintf(path, pathLen, "/mons/p%03u.bin", dexNum);
     f = SpriteFS.open(path, FILE_READ);
   }
-  if (!f) return false;
-
-  uint32_t size = f.size();
-  if (size < 7 || size > 3UL * 1024 * 1024) { f.close(); return false; }
-  blob = (uint8_t *)ps_malloc(size);
-  if (!blob || f.read(blob, size) != size || memcmp(blob, "TPK2", 4) != 0) {
-    if (blob) { free(blob); blob = nullptr; }
+  if (!f) return nullptr;
+  size = f.size();
+  if (size < 7 || size > 3UL * 1024 * 1024) { f.close(); return nullptr; }
+  uint8_t *b = (uint8_t *)ps_malloc(size);
+  if (!b || f.read(b, size) != size || memcmp(b, "TPK2", 4) != 0) {
+    if (b) free(b);
     f.close();
-    return false;
+    return nullptr;
   }
   f.close();
+  return b;
+}
+
+#if DROID_PREVIEW
+// Built-in droid sprite (flash), copied to PSRAM so unload() can free it as usual.
+static uint8_t *readBuiltinSprite(uint8_t dexNum, uint32_t &size, char *path, size_t pathLen) {
+  for (size_t i = 0; i < BUILTIN_SPRITE_COUNT; i++) {
+    if (BUILTIN_SPRITES[i].dex != dexNum) continue;
+    size = BUILTIN_SPRITES[i].size;
+    uint8_t *b = (uint8_t *)ps_malloc(size);
+    if (!b) return nullptr;
+    memcpy(b, BUILTIN_SPRITES[i].data, size);
+    snprintf(path, pathLen, "builtin p%03u", dexNum);
+    return b;
+  }
+  return nullptr;
+}
+#endif
+
+bool PmdMon::load(uint8_t dexNum, bool shiny) {
+  unload();
+
+  char path[28];
+  uint32_t size = 0;
+  blob = readSpriteFile(dexNum, shiny, size, path, sizeof(path));  // la SD manda
+#if DROID_PREVIEW
+  if (!blob) blob = readBuiltinSprite(dexNum, size, path, sizeof(path));
+#endif
+  if (!blob) return false;
 
   uint8_t nActs = blob[4];
   memcpy(&palCount, blob + 5, 2);

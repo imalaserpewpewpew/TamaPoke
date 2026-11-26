@@ -1,4 +1,5 @@
 #include "pet.h"
+#include "droid.h"
 #include "dex.h"
 #include "audio.h"
 
@@ -20,7 +21,11 @@ void Pet::newEgg() {
   speciesId = -1;
   prevSpeciesId = -1;
   eggTarget = pickEggSpecies();  // especie oculta segun rareza y pokedex
+#if DROID_PREVIEW
+  starterPick = false;  // TamaDroid preview: no starter pick, the crate holds the astromech
+#else
   starterPick = (registeredCount() == 0);  // primera partida: el jugador elige inicial
+#endif
   // sorteo shiny: 1/48 base, mejor con despedida y con racha/vinculo altos
   int shinyBase = (lastEnd == CER_FAREWELL ? 24 : 48) - careBonus();
   if (shinyBase < 8) shinyBase = 8;
@@ -35,6 +40,9 @@ void Pet::newEgg() {
   careMistakes = 0;
   mistakeCooldown = 0;
   sleeping = false;
+  missionJob = -1;     // a new droid starts at home (the parts bin stays)
+  missionsDone = 0;
+  missionLeft = 0;
   save();
 }
 
@@ -68,6 +76,7 @@ void Pet::syncClock(uint32_t nowEpoch) {
       if (ageMinutes >= 3) hatch();  // eclosiona en tu ausencia
       continue;
     }
+    if (missionMinute()) continue;  // TamaDroid: the mission keeps running while off
     if (sleeping) {  // descanso: baja lento y con suelo, igual que en vivo
       energy = clamp100(energy + 6);
       if (ageMinutes % 2 == 0) {
@@ -116,6 +125,10 @@ void Pet::tick() {
 
   if (isEgg()) {
     if (ageMinutes >= 3) hatch();  // si no lo tocas, eclosiona solo a los 3 min
+    return;
+  }
+  if (missionMinute()) {  // TamaDroid: away on a mission, needs barely move
+    if (++ticksSinceSave >= 5) pendingSave = true;
     return;
   }
 
@@ -219,6 +232,10 @@ uint8_t Pet::eggRarity() const {
 // elige la especie del huevo: tirada de rareza (mejorada por una despedida
 // completa, castigada por una escapada) y sesgo hacia lineas incompletas
 int16_t Pet::pickEggSpecies() {
+#if DROID_PREVIEW
+  static const int16_t DROIDS[] = { DROID_FIRST_DEX, DROID_BB_DEX, DROID_GONK_DEX };
+  return DROIDS[random(3)];  // TamaDroid preview: astromech, BB unit or Gonk
+#endif
   // primera partida: inicial clasico
   if (registeredCount() == 0) {
     return CLASSIC_DEX[random(NUM_CLASSIC_DEX)];
@@ -300,7 +317,11 @@ void Pet::checkMedals() {
   if (level() >= 10) medals |= MED_LV10;
   if (level() >= 25) medals |= MED_LV25;
   if (level() >= 50) medals |= MED_LV50;
+#if DROID_PREVIEW
+  if (missionsDone >= 10) medals |= MED_BERRY;  // TamaDroid: the 'favorite' medal is 10 missions
+#else
   if (berryKnown) medals |= MED_BERRY;
+#endif
   if (streak >= 7) medals |= MED_STREAK7;
   if (bond >= 100) medals |= MED_BOND;
   if (DEX_TBL[speciesId].evolvesTo == 0) medals |= MED_FINAL;
@@ -345,6 +366,7 @@ uint16_t Pet::registeredCount() const {
 // forma final que ya cumplio su ciclo (7 dias): lista para despedirse. La
 // despedida la dispara el usuario con el boton (no salta sola, para que la vea)
 bool Pet::canFarewellNow() const {
+  if (onMission()) return false;
   return !isEgg() && !sleeping && ceremony == CER_NONE &&
          DEX_TBL[speciesId].evolvesTo == 0 && ageMinutes >= FAREWELL_AGE_MIN;
 }
@@ -352,6 +374,7 @@ bool Pet::canFarewellNow() const {
 // abandono total durante 1h: lista para escaparse. La dispara el usuario con el
 // boton (final triste); cuidarla un solo tick la salva (neglectTicks se resetea)
 bool Pet::canRunawayNow() const {
+  if (onMission()) return false;
   return !isEgg() && !sleeping && ceremony == CER_NONE && neglectTicks >= RUNAWAY_TICKS;
 }
 
@@ -409,6 +432,7 @@ void Pet::hatch() {
 // (ninguna estadistica por debajo de 40). NO evoluciona sola: la dispara el
 // usuario tocando al bicho (evolve()), para que vea la transformacion.
 bool Pet::canEvolveNow() const {
+  if (onMission()) return false;
   if (isEgg() || sleeping || ceremony != CER_NONE) return false;
   const DexEntry &d = DEX_TBL[speciesId];
   if (d.evolvesTo == 0) return false;
@@ -436,10 +460,12 @@ void Pet::evolve() {
 }
 
 void Pet::feed() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   feedBerry(0);
 }
 
 void Pet::feedBerry(uint8_t color) {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   if (isEgg() || sleeping) return;
   if (lovesBerry(color)) {
@@ -456,7 +482,18 @@ void Pet::feedBerry(uint8_t color) {
   save();
 }
 
+void Pet::feedCell() {
+  if (onMission()) return;
+  if (ceremony != CER_NONE) return;
+  if (isEgg() || sleeping) return;
+  fullness = clamp100(fullness + 30);
+  eatUntil = millis() + EAT_ANIM_MS;
+  registerCare();
+  save();
+}
+
 void Pet::feedCandy() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   if (isEgg() || sleeping) return;
   fullness = clamp100(fullness + 10);
@@ -468,6 +505,7 @@ void Pet::feedCandy() {
 }
 
 void Pet::playResult(uint16_t fullScore) {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE || isEgg()) return;
   // el record guarda la puntuacion entera; las recompensas, topadas a 255 como antes (#48)
   uint8_t score = fullScore > 255 ? 255 : (uint8_t)fullScore;
@@ -487,6 +525,7 @@ void Pet::playResult(uint16_t fullScore) {
 
 // saco de entrenamiento: los golpes entrenan la fuerza. Devuelve la subida.
 uint8_t Pet::trainStrength(uint16_t hits) {
+  if (onMission()) return 0;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE || isEgg()) return 0;
   uint8_t gain = hits / 4;          // ~4 golpes = 1 punto de entrenamiento
   if (gain > 18) gain = 18;         // tope por sesion: la FUE se forja a fuego lento
@@ -508,7 +547,25 @@ uint8_t Pet::trainStrength(uint16_t hits) {
   return gain;
 }
 
+// TamaDroid circuit repair: rounds = sequences completed. Trains armor (DEF).
+void Pet::circuitResult(uint16_t rounds) {
+  if (onMission()) return;  // TamaDroid: the droid is away
+  if (ceremony != CER_NONE || isEgg()) return;
+  uint8_t r = rounds > 255 ? 255 : (uint8_t)rounds;
+  uint16_t v = (uint16_t)trDef + r / 2;
+  trDef = v > 100 ? 100 : (uint8_t)v;
+  joy = clamp100(joy + 5 + (r > 10 ? 25 : r * 2));
+  energy = dropTo(energy, 8 + r / 2, 5);
+  fullness = dropTo(fullness, 4, 5);
+  if (r >= 5) heartUntil = millis() + HEART_MS;
+  if (rounds > circHi) circHi = rounds;
+  addBond(2);
+  registerCare();
+  save();
+}
+
 void Pet::play() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   if (isEgg() || sleeping) return;
   joy = clamp100(joy + 25);
@@ -521,6 +578,7 @@ void Pet::play() {
 }
 
 void Pet::toggleLight() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   if (isEgg()) return;
   sleeping = !sleeping;
@@ -528,6 +586,7 @@ void Pet::toggleLight() {
 }
 
 void Pet::clean() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   poops = 0;
   hygiene = 100;
@@ -537,6 +596,7 @@ void Pet::clean() {
 }
 
 void Pet::caress() {
+  if (onMission()) return;  // TamaDroid: the droid is away
   if (ceremony != CER_NONE) return;
   if (isEgg() || sleeping) return;
   joy = clamp100(joy + 5);
@@ -596,6 +656,16 @@ void Pet::save() {
   prefs.putUShort("mstone", lastMilestone);
   prefs.putUShort("ghi", gameHi);
   prefs.putUShort("shi", strHi);
+  prefs.putUShort("chi", circHi);
+  prefs.putChar("mjob", missionJob);
+  prefs.putUShort("mleft", missionLeft);
+  prefs.putBytes("parts", parts, sizeof(parts));
+  prefs.putChar("rjob", repJob);
+  prefs.putUChar("rout", repOutcome);
+  prefs.putUChar("rln", repLine);
+  prefs.putBytes("rpart", repParts, sizeof(repParts));
+  prefs.putBool("rnew", repUnseen);
+  prefs.putUShort("mdone", missionsDone);
   prefs.putString("nick", nick);
 }
 
@@ -648,7 +718,115 @@ void Pet::load() {
   lastMilestone = prefs.getUShort("mstone", 0);
   gameHi = prefs.getUShort("ghi", 0);
   strHi = prefs.getUShort("shi", 0);
+  circHi = prefs.getUShort("chi", 0);
+  missionJob = prefs.getChar("mjob", -1);
+  if (missionJob >= MISSION_COUNT) missionJob = -1;
+  missionLeft = prefs.getUShort("mleft", 0);
+  prefs.getBytes("parts", parts, sizeof(parts));  // missing key leaves the zeros
+  repJob = prefs.getChar("rjob", -1);
+  if (repJob >= MISSION_COUNT) repJob = -1;
+  repOutcome = prefs.getUChar("rout", 0);
+  repLine = prefs.getUChar("rln", 0);
+  prefs.getBytes("rpart", repParts, sizeof(repParts));
+  repUnseen = prefs.getBool("rnew", false) && repJob >= 0;
+  missionsDone = prefs.getUShort("mdone", 0);
   prefs.getString("nick", nick, sizeof(nick));
   // siembra: la mascota actual cuenta como criada (guardados antiguos)
   if (speciesId >= 1) registerSpecies(speciesId);
+}
+
+// ---------------------------------------------------------------- TamaDroid missions
+
+static uint16_t weightedStat(uint16_t a, uint16_t d, uint16_t s, const MissionDef &m) {
+  return (uint16_t)(((uint32_t)a * m.wAtk + (uint32_t)d * m.wDef + (uint32_t)s * m.wSpe) / 100);
+}
+
+bool Pet::canStartMission(uint8_t job) const {
+  if (job >= MISSION_COUNT || isEgg() || sleeping || ceremony != CER_NONE || onMission()) return false;
+  if (level() < MISSIONS[job].minLevel) return false;
+  return energy >= 30 && hygiene >= 30;
+}
+
+bool Pet::startMission(uint8_t job) {
+  if (!canStartMission(job)) return false;
+  missionJob = (int8_t)job;
+  missionLeft = MISSIONS[job].minutes;
+  energy = clamp100(energy - 15);  // the trip itself costs some SYS
+  registerCare();
+  save();
+  return true;
+}
+
+// weighted stat for the job + luck (0..40) - carbon buildup (WGT/4) + bond/10, capped at 255
+uint8_t Pet::missionScore(uint8_t job, long luck) const {
+  if (job >= MISSION_COUNT) return 0;
+  int v = (int)weightedStat(atkStat(), defStat(), speStat(), MISSIONS[job]) + (int)luck - weight / 4 + bond / 10;
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+  return (uint8_t)v;
+}
+
+static void applyPart(Pet &p, uint8_t part) {
+  if (part >= PART_COUNT) return;
+  if (p.parts[part] < 99) p.parts[part]++;
+  auto up = [](uint8_t &t, uint8_t n) { uint16_t v = (uint16_t)t + n; t = v > 100 ? 100 : (uint8_t)v; };
+  switch (part) {
+    case PART_SENSOR:   up(p.trSpe, 2); break;
+    case PART_SERVO:    up(p.trAtk, 2); break;
+    case PART_PLATING:  up(p.trDef, 2); break;
+    case PART_COUPLING: p.energy = p.energy > 85 ? 100 : p.energy + 15; break;
+    case PART_HOLO:     up(p.trAtk, 1); up(p.trDef, 1); up(p.trSpe, 1); break;
+  }
+}
+
+void Pet::resolveMission() {
+  if (!onMission()) return;
+  uint8_t job = (uint8_t)missionJob;
+  const MissionDef &m = MISSIONS[job];
+  int margin = (int)missionScore(job, random(41)) - (int)m.difficulty;
+  uint8_t out = margin >= 25 ? MIS_GREAT : margin >= 0 ? MIS_SUCCESS : margin >= -20 ? MIS_ROUGH : MIS_FAILED;
+  repJob = (int8_t)job;
+  repOutcome = out;
+  repLine = (uint8_t)random(3);
+  repParts[0] = repParts[1] = 255;
+  switch (out) {
+    case MIS_GREAT:
+      repParts[0] = m.partA;
+      repParts[1] = (m.holoChance && random(m.holoChance) == 0) ? (uint8_t)PART_HOLO : m.partB;
+      addBond(3);
+      joy = clamp100(joy + 15);
+      break;
+    case MIS_SUCCESS:
+      repParts[0] = m.partA;
+      joy = clamp100(joy + 8);
+      break;
+    case MIS_ROUGH:
+      if (random(2) == 0) repParts[0] = m.partA;
+      hygiene = clamp100(hygiene - 30);
+      break;
+    default:  // failed
+      hygiene = clamp100(hygiene - 40);
+      joy = clamp100(joy - 20);
+      break;
+  }
+  for (uint8_t p : repParts) applyPart(*this, p);
+  if (out <= MIS_SUCCESS && missionsDone < 999) missionsDone++;
+  checkMedals();
+  missionJob = -1;
+  missionLeft = 0;
+  repUnseen = true;
+  pendingSave = true;
+}
+
+// one game minute of a mission (live tick or offline catch-up). While away the
+// droid's needs drift down very slowly with a floor, and nothing counts as neglect.
+bool Pet::missionMinute() {
+  if (!onMission()) return false;
+  if (ageMinutes % 4 == 0) {
+    fullness = dropTo(fullness, 1, 25);
+    joy = dropTo(joy, 1, 25);
+  }
+  if (missionLeft > 0) missionLeft--;
+  if (missionLeft == 0) resolveMission();
+  return true;
 }

@@ -42,6 +42,29 @@ enum : uint16_t {
 };
 #define MED_COUNT 8
 
+// ---- TamaDroid salvage missions ----------------------------------------
+// Parts found on missions: each gives a little training now and becomes a mod later.
+enum : uint8_t { PART_SENSOR = 0, PART_SERVO, PART_PLATING, PART_COUPLING, PART_HOLO, PART_COUNT };
+enum : uint8_t { MIS_GREAT = 0, MIS_SUCCESS, MIS_ROUGH, MIS_FAILED };
+struct MissionDef {
+  uint8_t minutes;      // game minutes away
+  uint8_t wAtk, wDef, wSpe;  // stat weights (sum 100): STR / ARM / SPD
+  uint8_t difficulty;   // compared against the weighted stat + luck
+  uint8_t minLevel;     // job unlocks at this level
+  uint8_t partA, partB; // usual finds (partB on a great run)
+  uint8_t holoChance;   // 1 in N chance of a rare holo-projector on a great run (0 = never)
+};
+#define MISSION_COUNT 6
+// dune scouting, moisture haul, vaporator repair, Jawa trade run, Tusken territory, sandcrawler salvage
+static const MissionDef MISSIONS[MISSION_COUNT] = {
+  { 15,  0,  0, 100, 40,  1, PART_SENSOR,   PART_COUPLING, 0 },
+  { 20, 100, 0,  0,  45,  1, PART_SERVO,    PART_COUPLING, 0 },
+  { 30,  0, 50, 50,  60,  3, PART_COUPLING, PART_SENSOR,   0 },
+  { 30, 50,  0, 50,  65,  5, PART_SERVO,    PART_SENSOR,   10 },
+  { 45,  0, 100, 0,  85,  8, PART_PLATING,  PART_PLATING,  5 },
+  { 60, 34, 33, 33,  95, 10, PART_PLATING,  PART_SERVO,    3 },
+};
+
 class Pet {
 public:
   // Estadisticas 0..100
@@ -78,6 +101,16 @@ public:
   uint16_t lastMilestone = 0;  // hito de racha ya celebrado
   uint16_t gameHi = 0;     // record del minijuego (del jugador)
   uint16_t strHi = 0;      // record de golpes al saco
+  uint16_t circHi = 0;     // TamaDroid: best circuit-repair round
+  // TamaDroid missions (the droid is away while missionJob >= 0)
+  int8_t missionJob = -1;
+  uint16_t missionLeft = 0;           // game minutes until it comes back
+  uint8_t parts[PART_COUNT] = { 0 };  // player's parts bin (kept between droids)
+  int8_t repJob = -1;                 // last mission report
+  uint8_t repOutcome = 0, repLine = 0;
+  uint8_t repParts[2] = { 255, 255 }; // parts found (255 = none)
+  bool repUnseen = false;             // report waiting to be shown
+  uint16_t missionsDone = 0;          // successful missions by this droid (10 = medal)
 
   void begin();                 // carga estado de NVS (o crea el primer huevo)
   void update(uint32_t nowMs);  // llamar en cada loop()
@@ -86,11 +119,18 @@ public:
   void feed();              // baya roja (compatibilidad)
   void feedBerry(uint8_t color);  // 0 roja, 1 azul, 2 verde
   void feedCandy();
+  void feedCell();          // TamaDroid: the one power cell (charges PWR)
   bool lovesBerry(uint8_t color) const {
     return !isEgg() && (speciesId % 3) == color;  // gusto oculto por especie
   }
   void playResult(uint16_t fullScore);  // recompensa del minijuego (entrena VEL)
   uint8_t trainStrength(uint16_t hits);  // saco de entrenamiento (entrena FUE)
+  void circuitResult(uint16_t rounds);   // TamaDroid circuit repair (trains DEF/armor)
+  bool onMission() const { return missionJob >= 0; }
+  bool canStartMission(uint8_t job) const;  // awake, SYS/OIL >= 30, level unlocked, not away
+  bool startMission(uint8_t job);
+  uint8_t missionScore(uint8_t job, long luck) const;  // weighted stat + luck - carbon (for tests/UI)
+  void seenReport() { repUnseen = false; pendingSave = true; }
 
   // stats de combate: base real de gen 1 x genes + nivel + entrenamiento
   uint16_t atkStat() const;
@@ -198,6 +238,8 @@ private:
   void addBond(uint8_t amt);
   void checkMedals();
   void tick();
+  void resolveMission();
+  bool missionMinute();  // one game minute away; true = handled (skip normal decay)
   void hatch();
   void registerSpecies(int16_t dex);
   void save();

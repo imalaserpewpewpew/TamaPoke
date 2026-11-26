@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "i18n.h"  // gLang
+#include "droid.h"
 
 // GENERADO por tools/gen_dex.py desde tools/dex_data.py - no editar
 
@@ -22,15 +23,31 @@ struct DexEntry {
 
 static const DexEntry DEX_TBL[DEX_COUNT + 1] = {
   { "?", 0, 0, 0, 0x2946, 50, 50, 50, 50, 0 },  // 0: sin usar
+#if DROID_PREVIEW
+  // TamaDroid: 1-3 astromech (sturdy), 4-6 BB unit (fast, light). Restores at lv 16 / 32.
+  { "R-UNIT", 2, 16, R_COMUN, 0x3C49, 45, 45, 55, 40, 6 },  // 1 astromech, scrap
+  { "R-UNIT", 3, 32, R_EVO, 0x3C49, 60, 58, 72, 52, 6 },  // 2 astromech, repaired
+  { "R-UNIT", 0, 0, R_EVO, 0x3C49, 80, 76, 92, 66, 6 },  // 3 astromech, restored
+  { "BB-UNIT", 5, 16, R_COMUN, 0x2D53, 40, 42, 38, 68, 6 },  // 4 BB unit, scrap
+  { "BB-UNIT", 6, 32, R_EVO, 0x2D53, 55, 55, 50, 88, 6 },  // 5 BB unit, repaired
+  { "BB-UNIT", 0, 0, R_EVO, 0x2D53, 75, 70, 64, 110, 6 },  // 6 BB unit, restored
+#else
   { "BULBASAUR", 2, 16, R_COMUN, 0x3C49, 45, 49, 49, 45, 2 },  // 1 planta
   { "IVYSAUR", 3, 32, R_EVO, 0x3C49, 60, 62, 63, 60, 2 },  // 2 planta
   { "VENUSAUR", 0, 0, R_EVO, 0x3C49, 80, 82, 83, 80, 2 },  // 3 planta
   { "CHARMANDER", 5, 16, R_COMUN, 0xEA87, 39, 52, 43, 65, 3 },  // 4 fuego
   { "CHARMELEON", 6, 36, R_EVO, 0xEA87, 58, 64, 58, 80, 3 },  // 5 fuego
   { "CHARIZARD", 0, 0, R_EVO, 0xEA87, 78, 84, 78, 100, 3 },  // 6 fuego
+#endif
+#if DROID_PREVIEW
+  { "GONK", 8, 16, R_COMUN, 0xCD4F, 70, 40, 60, 25, 6 },  // 7 Gonk power droid, scrap
+  { "GONK", 9, 32, R_EVO, 0xCD4F, 90, 52, 78, 32, 6 },  // 8 Gonk, repaired
+  { "GONK", 0, 0, R_EVO, 0xCD4F, 115, 66, 98, 40, 6 },  // 9 Gonk, restored
+#else
   { "SQUIRTLE", 8, 16, R_COMUN, 0x4C98, 44, 48, 65, 43, 1 },  // 7 agua
   { "WARTORTLE", 9, 36, R_EVO, 0x4C98, 59, 63, 80, 58, 1 },  // 8 agua
   { "BLASTOISE", 0, 0, R_EVO, 0x4C98, 79, 83, 100, 78, 1 },  // 9 agua
+#endif
   { "CATERPIE", 11, 7, R_COMUN, 0x7CC4, 45, 30, 35, 45, 2 },  // 10 bicho
   { "METAPOD", 12, 10, R_EVO, 0x7CC4, 50, 20, 55, 30, 2 },  // 11 bicho
   { "BUTTERFREE", 0, 0, R_EVO, 0x7CC4, 60, 45, 50, 70, 2 },  // 12 bicho
@@ -346,6 +363,17 @@ static const char *const DEX_NAME_KO[DEX_COUNT + 1] = {
 // idioma no tiene nombre propio para ella).
 static inline const char *dexName(int16_t dex) {
   if (dex < 1 || dex > DEX_COUNT) return DEX_TBL[0].name;
+#if DROID_PREVIEW
+  if (dex == 1) return "SCRAP R-UNIT";
+  if (dex == 2) return "R-UNIT";
+  if (dex == 3) return "R-UNIT MK.II";
+  if (dex == 4) return "SCRAP BB-UNIT";
+  if (dex == 5) return "BB-UNIT";
+  if (dex == 6) return "BB-UNIT MK.II";
+  if (dex == 7) return "SCRAP GONK";
+  if (dex == 8) return "GONK";
+  if (dex == 9) return "GONK MK.II";
+#endif
   const char *n = (gLang == LANG_FR)   ? DEX_NAME_FR[dex]
                   : (gLang == LANG_DE) ? DEX_NAME_DE[dex]
                   : (gLang == LANG_JA) ? DEX_NAME_JA[dex]
